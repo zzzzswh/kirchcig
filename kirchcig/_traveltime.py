@@ -112,6 +112,22 @@ def eikonal_traveltime(pos, vel, dx, dz, ox=0.0, oz=0.0, order=2, src_radius=Non
     return out
 
 
+def table_gradients(trav, dx, dz):
+    """Traveltime gradients ``(dT/dx, dT/dz)`` [s/m] by second-order central
+    differences (one-sided at the edges), as an ``(n, nx, nz, 2)`` float32
+    array. Used for the emergence angles and for the image-cell footprint of
+    the anti-alias filter (``aa_stretch``)."""
+    trav = np.asarray(trav)
+    if trav.ndim != 3 or trav.shape[1] < 2 or trav.shape[2] < 2:
+        raise ValueError("trav must be (n, nx, nz) with nx, nz >= 2")
+    out = np.empty(trav.shape + (2,), dtype=np.float32)
+    for i in range(trav.shape[0]):
+        ti = trav[i].astype(np.float64, copy=False)
+        out[i, ..., 0] = np.gradient(ti, dx, axis=0)
+        out[i, ..., 1] = np.gradient(ti, dz, axis=1)
+    return out
+
+
 def emergence_angles(trav, dx, dz):
     """Emergence angle from the vertical, ``atan2(dT/dx, dT/dz)``, in radians.
 
@@ -126,16 +142,8 @@ def emergence_angles(trav, dx, dz):
     -------
     (n, nx, nz) float32 array of angles [rad]
     """
-    trav = np.asarray(trav)
-    if trav.ndim != 3 or trav.shape[1] < 2 or trav.shape[2] < 2:
-        raise ValueError("trav must be (n, nx, nz) with nx, nz >= 2")
-    out = np.empty(trav.shape, dtype=np.float32)
-    for i in range(trav.shape[0]):
-        ti = trav[i].astype(np.float64, copy=False)
-        gx = np.gradient(ti, dx, axis=0)
-        gz = np.gradient(ti, dz, axis=1)
-        out[i] = np.arctan2(gx, gz)
-    return out
+    g = table_gradients(trav, dx, dz)
+    return np.arctan2(g[..., 0], g[..., 1]).astype(np.float32)
 
 
 def trace_spacing(pos):

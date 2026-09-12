@@ -13,6 +13,10 @@ shared-memory allocation are injected as ``-D`` flags by ``_engine_cuda.py``:
             final model directly, ``ACC`` when writing per-split partial sums
     ANGLE   0 = offset-domain gathers, 1 = angle-domain gathers
     AA      0 = plain summation, 1 = anti-alias triangle filtering
+    AAS     1 = the filter width also covers the image cell's time footprint
+            (anti-aliased stretch); needs the traveltime-gradient tables
+    WEIGHT  1 = multiply every contribution by w_s(s, ip) * w_r(r, ip), the
+            product of two per-side amplitude tables packed into the element
 
 Both kernels compute the interpolation index and weights with the *same*
 float32 expression, so the pair is an exact transpose to accumulator precision.
@@ -21,7 +25,12 @@ Anti-alias filtering (AA = 1)
 -----------------------------
 Every contribution is read through a normalised triangle filter whose
 half-width ``n`` follows the local operator dip (Lumley, Claerbout and Bevc
-1994). The triangle is applied with the double-running-integration identity
+1994) and, with AAS, the time footprint of the image cell (Madagascar's
+``aastretch``: an image sample stands for a ``dx * dz`` cell whose traveltime
+spans ``|dtau/dx| dx + |dtau/dz| dz``; spreading it over that span keeps a
+coarse depth grid from demigrating into a comb of spikes). The two widths
+combine as a root mean square. The triangle is applied with the
+double-running-integration identity
 
     (1/n^2) * (D[i+n-1] - 2 D[i-1] + D[i-n-1])  =  (T_n * d)[i]
 
@@ -44,6 +53,15 @@ CUDA_SOURCE = r"""
 #ifndef AA
 #define AA 0
 #endif
+#ifndef AAS
+#define AAS 0
+#endif
+#if AAS && !AA
+#error "AAS needs AA"
+#endif
+#ifndef WEIGHT
+#define WEIGHT 0
+#endif
 
 // ---------------------------------------------------------------------------
 // double atomicAdd fallback for pre-Pascal devices (sm < 60). Only used in the
@@ -65,25 +83,42 @@ __device__ __forceinline__ double atomicAdd(double* address, double val)
 
 // ---------------------------------------------------------------------------
 // Traveltime table element. Whatever else a table row carries per image point
-// (emergence angle for the angle domain, operator dip for anti-aliasing) is
-// packed next to the traveltime so everything comes from a single aligned,
-// coalesced load.
+// (emergence angle for the angle domain, operator dip for anti-aliasing, an
+// amplitude weight) is packed next to the traveltime, in the fixed order
+// t, a, d, w, padded to 1, 2 or 4 floats so it always comes from a single
+// aligned, coalesced load. The host packs the same order (_engine_cuda._upload).
 // ---------------------------------------------------------------------------
-#if ANGLE && AA
-struct alignas(16) tab_t { float t; float a; float d; float pad_; };
-#define TAB_T(v) ((v).t)
-#define TAB_D(v) ((v).d)
-#elif ANGLE
-struct alignas(8) tab_t { float t; float a; };
-#define TAB_T(v) ((v).t)
-#elif AA
-struct alignas(8) tab_t { float t; float d; };
-#define TAB_T(v) ((v).t)
-#define TAB_D(v) ((v).d)
-#else
+#define KC_NFIELDS (1 + ANGLE + AA + WEIGHT)
+#if KC_NFIELDS == 1
 typedef float tab_t;
 #define TAB_T(v) (v)
+#else
+#if KC_NFIELDS == 2
+struct alignas(8) tab_t {
+#else
+struct alignas(16) tab_t {
 #endif
+    float t;
+#if ANGLE
+    float a;
+#endif
+#if AA
+    float d;
+#endif
+#if WEIGHT
+    float w;
+#endif
+#if KC_NFIELDS == 3
+    float pad_;
+#endif
+};
+#define TAB_T(v) ((v).t)
+#define TAB_D(v) ((v).d)
+#define TAB_W(v) ((v).w)
+#endif
+
+// Traveltime gradient (d/dx, d/dz) [s/m] per image point, read only with AAS.
+struct alignas(8) grad_t { float gx; float gz; };
 
 // Data-side element types. With anti-aliasing the adjoint reads the float64
 // double integral and the forward writes float64 partial sums; otherwise both
@@ -124,20 +159,33 @@ __device__ __forceinline__ int kc_angle_bin(float ths, float thr, float ihd, flo
 #endif
 
 #if AA
-// Triangle half-width in samples: n = clip(round(dip * aaf + 1), 1, nmax) where
-// dip is the summed source+receiver operator dip [s/m] and aaf carries
-// aa_factor * drho / dt for the trace. Mirrored bit-for-bit by
-// _engine_numpy.aa_width: the product is rounded to float32, then 1.5 is added
-// in float64 (exact) and truncated. The float -> double conversion between the
-// multiply and the add is what stops the compiler from fusing them into an FMA
-// with a different rounding.
-__device__ __forceinline__ int kc_aa_width(float dip, float aaf, int nmax)
+// Triangle half-width in samples:
+//     n = clip(round(aa_factor * sqrt((dip*aaf)^2 + cell^2) + 1), 1, nmax)
+// dip is the summed source+receiver operator dip [s/m], aaf = drho/dt the
+// trace's effective spacing (so dip*aaf is the time shift between neighbouring
+// traces in samples), cell the image cell's time footprint in samples (0
+// without AAS). Mirrored bit-for-bit by _engine_numpy.aa_width: the __*_rn
+// intrinsics stop the compiler from fusing anything into an FMA with a
+// different rounding, sqrtf is correctly rounded, and the final 1.5 is added
+// in float64 (exact) before truncation.
+__device__ __forceinline__ int kc_aa_width(float dip, float aaf, float cell, float aa_factor, int nmax)
 {
-    const float x = dip * aaf;
-    int n = (int)((double)x + 1.5);
+    const float a = __fmul_rn(dip, aaf);
+    const float w = __fmul_rn(aa_factor, sqrtf(__fadd_rn(__fmul_rn(a, a), __fmul_rn(cell, cell))));
+    int n = (int)((double)w + 1.5);
     if (n < 1) n = 1;
     if (n > nmax) n = nmax;
     return n;
+}
+#endif
+#if AAS
+// |gx_s + gx_r| dx/dt + |gz_s + gz_r| dz/dt: gradients summed before the
+// absolute value so the footprint vanishes at the specular point.
+__device__ __forceinline__ float kc_aa_cell(grad_t gs, grad_t gr, float dxdt, float dzdt)
+{
+    const float bx = __fmul_rn(fabsf(__fadd_rn(gs.gx, gr.gx)), dxdt);
+    const float bz = __fmul_rn(fabsf(__fadd_rn(gs.gz, gr.gz)), dzdt);
+    return __fadd_rn(bx, bz);
 }
 #endif
 
@@ -160,16 +208,19 @@ __device__ __forceinline__ int kc_aa_width(float dip, float aaf, int nmax)
 // sample 0 in that row (nt and 0 without anti-aliasing).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(BLOCK)
-kirch_adjoint(const din_t* __restrict__ data,
-              const tab_t* __restrict__ tab_s,
-              const tab_t* __restrict__ tab_r,
-              const int*   __restrict__ hbin,
-              const float* __restrict__ aaf,
-              OUT*         __restrict__ out,
+kirch_adjoint(const din_t*  __restrict__ data,
+              const tab_t*  __restrict__ tab_s,
+              const tab_t*  __restrict__ tab_r,
+              const grad_t* __restrict__ grd_s,
+              const grad_t* __restrict__ grd_r,
+              const int*    __restrict__ hbin,
+              const float*  __restrict__ aaf,
+              OUT*          __restrict__ out,
               const int ns, const int nr, const int nt, const int npts,
               const int s_per_split,
               const int npad, const int pad, const int aa_max,
-              const float idt, const float ihd, const float hmax_rad)
+              const float idt, const float ihd, const float hmax_rad,
+              const float aa_factor, const float dxdt, const float dzdt)
 {
     extern __shared__ ACC acc[];                       // [NH][BLOCK]
     const int tid = threadIdx.x;
@@ -188,6 +239,9 @@ kirch_adjoint(const din_t* __restrict__ data,
 #if AA
             const float* __restrict__ arow = aaf + (size_t)s * nr;
 #endif
+#if AAS
+            const grad_t gs = grd_s[(size_t)s * npts + ip];
+#endif
 
             for (int r = 0; r < nr; ++r) {
                 const int hb = hrow[r];                // uniform across the block
@@ -205,18 +259,29 @@ kirch_adjoint(const din_t* __restrict__ data,
 #endif
                 const float w = t - (float)it;
                 const din_t* __restrict__ tr = dsrc + (size_t)r * npad + (it + pad);
+#if WEIGHT
+                const ACC wt = (ACC)__fmul_rn(TAB_W(vs), TAB_W(vr));
+#else
+                const ACC wt = (ACC)1;
+#endif
 #if AA
                 // tap(off) = D[it+off]*(1-w) + D[it+off+1]*w, all float64.
-                const int    n  = kc_aa_width(TAB_D(vs) + TAB_D(vr), arow[r], aa_max);
+#if AAS
+                const float cell = kc_aa_cell(gs, grd_r[(size_t)r * npts + ip], dxdt, dzdt);
+#else
+                const float cell = 0.0f;
+#endif
+                const int    n  = kc_aa_width(__fadd_rn(TAB_D(vs), TAB_D(vr)), arow[r], cell,
+                                              aa_factor, aa_max);
                 const double w1 = (double)(1.0f - w), w2 = (double)w;
                 const double tp  = tr[n - 1]  * w1 + tr[n]      * w2;
                 const double tm  = tr[-1]     * w1 + tr[0]      * w2;
                 const double tmm = tr[-n - 1] * w1 + tr[-n]     * w2;
                 const double nn  = (double)n * (double)n;
-                acc[h * BLOCK + tid] += (ACC)((tp - 2.0 * tm + tmm) / nn);
+                acc[h * BLOCK + tid] += wt * (ACC)((tp - 2.0 * tm + tmm) / nn);
 #else
-                acc[h * BLOCK + tid] += (ACC)tr[0] * (ACC)(1.0f - w)
-                                      + (ACC)tr[1] * (ACC)w;
+                acc[h * BLOCK + tid] += wt * ((ACC)tr[0] * (ACC)(1.0f - w)
+                                            + (ACC)tr[1] * (ACC)w);
 #endif
             }
         }
@@ -244,16 +309,19 @@ kirch_adjoint(const din_t* __restrict__ data,
 // samples; the host reverse-integrates the float64 output twice.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(FBLOCK)
-kirch_forward(const float* __restrict__ model,
-              const tab_t* __restrict__ tab_s,
-              const tab_t* __restrict__ tab_r,
-              const int*   __restrict__ hbin,
-              const float* __restrict__ aaf,
-              dout_t*      __restrict__ data,
+kirch_forward(const float*  __restrict__ model,
+              const tab_t*  __restrict__ tab_s,
+              const tab_t*  __restrict__ tab_r,
+              const grad_t* __restrict__ grd_s,
+              const grad_t* __restrict__ grd_r,
+              const int*    __restrict__ hbin,
+              const float*  __restrict__ aaf,
+              dout_t*       __restrict__ data,
               const int ns, const int nr, const int nt, const int npts,
               const int tchunk,
               const int npad, const int pad, const int aa_max,
-              const float idt, const float ihd, const float hmax_rad)
+              const float idt, const float ihd, const float hmax_rad,
+              const float aa_factor, const float dxdt, const float dzdt)
 {
     extern __shared__ facc_t trace[];                  // [tchunk]
     const int tid  = threadIdx.x;
@@ -281,6 +349,10 @@ kirch_forward(const float* __restrict__ model,
 #if AA
     const float aaf_pair = aaf[pair];
 #endif
+#if AAS
+    const grad_t* __restrict__ gs_row = grd_s + (size_t)s * npts;
+    const grad_t* __restrict__ gr_row = grd_r + (size_t)r * npts;
+#endif
 
     for (int ip = tid; ip < npts; ip += FBLOCK) {
         const tab_t vs = ts[ip];
@@ -290,7 +362,12 @@ kirch_forward(const float* __restrict__ model,
         if (it < 0 || it >= nt - 1) continue;
         const int i0 = it + pad - t0;                  // window-relative index of sample it
 #if AA
-        const int n = kc_aa_width(TAB_D(vs) + TAB_D(vr), aaf_pair, aa_max);
+#if AAS
+        const float cell = kc_aa_cell(gs_row[ip], gr_row[ip], dxdt, dzdt);
+#else
+        const float cell = 0.0f;
+#endif
+        const int n = kc_aa_width(__fadd_rn(TAB_D(vs), TAB_D(vr)), aaf_pair, cell, aa_factor, aa_max);
         if (i0 + n < 0 || i0 - n - 1 >= nloc) continue;   // all six taps outside this window
 #else
         if (i0 < -1 || i0 >= nloc) continue;          // neither tap in this window
@@ -303,9 +380,14 @@ kirch_forward(const float* __restrict__ model,
         const float mv = mh[ip];
 #endif
         const float w = t - (float)it;
+#if WEIGHT
+        const ACC wt = (ACC)__fmul_rn(TAB_W(vs), TAB_W(vr));
+#else
+        const ACC wt = (ACC)1;
+#endif
 #if AA
         const double nn = (double)n * (double)n;
-        const double v  = (double)mv / nn;
+        const double v  = ((double)mv * (double)wt) / nn;
         const double w1 = (double)(1.0f - w), w2 = (double)w;
         const double a1 = v * w1, a2 = v * w2;
         // taps: +1 at it+n-1, -2 at it-1, +1 at it-n-1, each spread over (i, i+1)
@@ -320,7 +402,7 @@ kirch_forward(const float* __restrict__ model,
         if (i >= 0     && i < nloc)     atomicAdd(&trace[i],     a1);
         if (i + 1 >= 0 && i + 1 < nloc) atomicAdd(&trace[i + 1], a2);
 #else
-        const ACC v = (ACC)mv;
+        const ACC v = (ACC)mv * wt;
         if (i0 >= 0)        atomicAdd(&trace[i0],     v * (ACC)(1.0f - w));
         if (i0 + 1 < nloc)  atomicAdd(&trace[i0 + 1], v * (ACC)w);
 #endif

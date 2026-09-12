@@ -23,6 +23,18 @@
   the same contributions, the pair stays an exact transpose, and the skipped
   contributions cost nothing. `aperture_masks()` diagnostic,
   `benchmarks/bench.py --aperture`.
+- Anti-aliased stretch, `aa_stretch=True` (default with `aa`): the filter
+  width also covers the image cell's time footprint `|dtau/dx| dx + |dtau/dz|
+  dz` (Madagascar `aastretch`), RMS-combined with the trace-axis term, so a
+  depth grid coarser than the time sampling demigrates into a smooth trace
+  instead of a comb. Needs a second, `float2` traveltime-gradient table per
+  side (`table_gradients`, shared with the emergence angles). Width arithmetic
+  uses `__fmul_rn`/`__fadd_rn` so the two engines stay bit-identical.
+- Amplitude weights, `weight=`: per-side tables multiplied in both kernels
+  (`w_s * w_r`, packed into the traveltime-table element, no extra memory
+  transaction). Presets `"obliquity"` (`sqrt(cos theta)`) and `"spreading"`
+  (`1/sqrt(t)`), lists of presets, a callable `f(t, theta, dt)`, or a pair of
+  ready tables. `weights` property, `weight_tables()`, `bench.py --weight`.
 - Half-derivative (rho) filter, `halfderiv=True`: `H = sqrt(1 - rho e^{-iw})`
   on the traces after `forward`, its exact transpose on the data before
   `adjoint` (Madagascar `sf_halfint`, same default leak `1 - 1/nt`). Float64

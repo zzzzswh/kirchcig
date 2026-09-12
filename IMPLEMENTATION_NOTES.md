@@ -55,6 +55,14 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
   **注意实验教训**：用点散射体测相位是错的——所有道的曲线都精确过那个点，求和是相干的，没有驻相，
   单位权 `Aᵀd` 本身就是零相位；45° 只出现在对反射层的横向积分里。另一个教训：深度网格粗于时间采样
   （`2·dz/v > dt`）时正演出来的道是一排插值脉冲，谱分析全是假象，见第 10 节。
+- **幅度权**（`weight=`）：每项贡献乘 `float32(w_s·w_r)`，`w` 作为第四个字段打包进 `tab_t`
+  （字段顺序固定 `t, a, d, w`，按在用的字段数补到 1/2/4 个 float，所以 16 字节以内装得下全部组合，
+  `KC_NFIELDS` 宏 + 主机 `_upload` 同序打包）。可分离乘积的设计是刻意的：不多一次访存，两侧各一张表就能
+  表达倾斜、扩散以及用户任意的 `w_s·w_r`。代价是 `sfkirmod` 的算术平均倾斜 `(cos_s+cos_r)/2` 只能
+  用几何平均 `sqrt(cos_s·cos_r)` 近似（二阶一致），Bleistein 真幅度权（含 Beylkin 行列式、`∂²τ/∂x²`）
+  不可分离、不提供。预设：`obliquity = sqrt(max(cos θ, 0))`，`spreading = 1/sqrt(max(t, dt))`。
+  验证：单点模型的加权正演 = 不加权正演 × 每道标量 `w_s(ip)·w_r(ip)`（精确恒等式）；零炮检距单道偏移
+  圆上加权/不加权之比 = cos θ；与 aa、halfderiv、aperture 组合 dot-test 通过；仿真下两引擎逐位一致。
 - **精确共轭**：两个内核用**完全相同的 float32 表达式**计算 `t`、`it`、`w`，权重转成累加精度后相乘，因此 forward/adjoint 是同一稀疏矩阵的转置；差别只来自 float64 求和顺序。
 
 ## 4. GPU 内核设计（对应 README "Design notes"）
@@ -112,6 +120,15 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
   `D` 为道的双重累加。3 次读取与 n 无关（LCB 的核心技巧）。半宽
   `n = round((dip_s + dip_r)·aa_factor·Δρ/dt + 1)`，末尾 `+1` 对应 `trimo`/`sfmig2`
   的 `+dt`，`n = 1` 即恒等。
+- **拉伸项（`aa_stretch`，默认开）**：Madagascar `aastretch` 的思路。成像样点代表一个 `dx×dz` 单元，
+  它在道上的时间足迹是 `|∂τ/∂x|·dx + |∂τ/∂z|·dz`（线性函数在矩形上的值域，L1），`τ = T_s + T_r`，
+  梯度**先求和再取绝对值**——镜面点处 `∂T_s/∂x` 与 `∂T_r/∂x` 相消，足迹只剩 `2dz/v`；若分别取绝对值
+  会在最重要的镜面贡献上过度滤波。与道轴项按均方根合并（两种独立的模糊叠加，二阶矩相加，LCB 式 5 同理），
+  `aa_factor` 缩放整体：`n = round(aa_factor·sqrt((dip·Δρ/dt)² + cell²) + 1)`。梯度表 `(n, npts, 2)`
+  float32（`table_gradients`，出射角也从它算），内核里是 `float2` 大小的 `grad_t`，每对多读 8 B。
+  验证：单炮、dz=5 m、dt=1 ms（每个深度样点隔 5 个时间样点），水平反射层零炮检距道对 dz=1 m 参考的
+  相对 L2 误差 0.52 → 0.10，175 Hz 处的谱复制 53.7 → 0.84（参考 0.12）；剩下的 10% 是三角形在 25 Hz
+  的固有幅度损失（sinc²）。
 - **`aa_factor`**：等价于 Claerbout `trimo` 与 Madagascar `sfmig2` 的 `antialias`，
   三者默认都是 1.0。2.0 把三角滤波的第一个零点放在假频上（LCB 式 12），是 Claerbout
   偏移时用的值，代价是陡倾处分辨率。
@@ -124,10 +141,11 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
   本实现尚未采用，是后续可以简化的地方。）
 - **精度**：float64 的 `D` 做二阶差分存在相消。实测 `n=1` 重建相对误差在白噪声下
   约 4e-9、带限子波下 ~1e-20，且不随 `nt` 增长（测到 4001），远低于 float32 的 1.2e-7。
-- **半宽表达式**：`n = int(float64(float32(dip·aaf)) + 1.5)`，再裁到 `[1, aa_max]`。乘法在
-  float32 里先舍入，加 1.5 在 float64 里做（精确）再截断。中间那次 float→double 转换是刻意的：
-  写成 float32 的 `dip*aaf + 1.5f` 会被 GPU 编译器融合成 FMA，舍入不同就可能落到另一个整数，
-  两个引擎的滤波宽度就对不上。numpy 的 `aa_width` 与内核的 `kc_aa_width` 逐位相同。
+- **半宽表达式**：float32 里算 `w = aa_factor·sqrtf((dip·aaf)² + cell²)`，每个乘、加都用 `__fmul_rn`/
+  `__fadd_rn`（禁止编译器融合成 FMA——融合后舍入不同，落到另一个整数两个引擎就对不上；`sqrtf` 默认
+  正确舍入），最后 `n = int(float64(w) + 1.5)` 再裁到 `[1, aa_max]`。numpy 的 `aa_width`/`aa_cell` 按同样
+  的运算顺序逐位镜像；g++ 仿真里这两个 intrinsic 就是普通乘加（`-std=c++17` 关掉了 contraction）。
+  NVRTC 对这两个 intrinsic 的支持有待真机确认。
 - **CUDA 实现**（`_engine_cuda.py` / `_kernels.py`）：
   - 倾角表打包进 `tab_t`：offset 域 `{t, d}`（8 B），angle 域 `{t, a, d, _}`（16 B，补一个 pad
     保证对齐），仍是一次合并读取。`aaf` 是 `(ns, nr)` 的设备数组，伴随里对整个 block 一致。
@@ -146,7 +164,10 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
     远小于 `2·aa_max`）与 source 分片与不分块结果 <1e-6。真实 GPU 上 `cp.cumsum` 是并行 scan，
     与串行求和差在 1e-16·D 量级，对结果的影响同样在 1e-9 以下。
   - **V100 实测**（README 规模，nh=32，float64）：全部 cuda 测试通过（NVRTC 接受 `alignas(16)`
-    结构体）；adjoint 98.5 ms（不开 52.9），forward 67.4 ms（不开 25.5），dot-test 2.0e-8。正演的
+    结构体和 `__fmul_rn`/`__fadd_rn`）；同一 session 内：`aa_stretch=False` adjoint 77.3 / forward 67.3 ms，
+    `aa_stretch=True` 128.8 / 72.0 ms（另一天 `aa_stretch=False` 测得 98.5 ms——session 间差 25%，
+    比较只看同一次测的）。梯度表那 8 B/pair 让伴随慢 1.7 倍，说明伴随受表读取而非算术限制；下一步
+    优化是把 `gx, gz` 打包进 `tab_t`（offset 域 `{t,d,gx,gz}` 正好 16 B；angle 域会到 32 B）。正演的
     2.6 倍比伴随的 1.9 倍重，来源是 6 次共享内存 double 原子加、`(ns,nr,npad)` float64 写出以及
     主机侧两次反向 `cumsum`；如果以后要压这部分，可以考虑在内核里用 block 内 scan 直接做反向双重
     积分，省掉 float64 中间缓冲。
@@ -161,8 +182,8 @@ Madagascar `user/yliu/Mmig2.c` (`sfmig2`)。
 
 ## 9. 已知限制（与 README 一致）
 
-仅 2D；offset 域按绝对半炮检距分箱不区分正负；变速度走时依赖 scikit-fmm 的一阶到达；无幅度权；正演不对
-深度→时间拉伸做抗假频（见第 10 节）。
+仅 2D；offset 域按绝对半炮检距分箱不区分正负；变速度走时依赖 scikit-fmm 的一阶到达；幅度权只到可分离的
+倾斜/扩散因子，没有真幅度权（见第 10 节）。
 
 ## 10. 路线图：对照 Madagascar 还缺什么
 
@@ -173,16 +194,13 @@ Madagascar `user/yliu/Mmig2.c` (`sfmig2`)。
 2. ~~**孔径控制**~~ 已完成（0.2.0，第 3 节）：`aperture=`（`sfkirmig`）与 `apt=`（`sfmig2`），
    主机端表掩码实现。`sfmig2` 的 `angle=`（倾角孔径，`|x| > tan(angle)·v·t` 跳过）是时间偏移的
    等价物，深度偏移里锥角已经覆盖。边缘余弦 taper 留到幅度权一起做。
-3. **幅度权**。`sfkirmod` 用 `obl = 0.5(cos θ_s + cos θ_r)` 与几何扩散，`sfkirchnew` 的 pseudo-unitary
-   权 `ps`，`sftkirmig` 的 `amp=`。本项目是纯单位权求和，不是真幅度。实现是每个 (道, 成像点) 乘一个
-   两个内核共用的权表达式；出射角表已经有（angle 域），offset 域也可算。
+3. ~~**幅度权**~~ 可分离部分已完成（0.2.0，第 3 节 `weight=`）。剩下的是不可分离的真幅度权
+   （Bleistein/Schleicher，含 `∂²τ/∂x²` 的 Beylkin 行列式），需要每 (道, 成像点) 现场算或另存表，
+   以及 `sfkirchnew` 风格的 pseudo-unitary 权 `cos θ/√t`（总走时的函数，也不可分离；近似可用
+   `["obliquity","spreading"]`，零炮检距时差一个 `√t` 因子）。
 4. **走时表插值**。`sfkirmig` 只在 `ny` 个稀疏地表位置存表，炮检点之间 Hermite 插值。本项目每炮每检
    一张完整表，`(ns+nr)·nx·nz·4` 字节，是上实际数据的真正瓶颈。改动较大。
-5. **正演的拉伸抗假频**（做半阶导数时发现）。正演把一列深度样点映射到时间，`2·dz/v > dt` 时每个深度样点
-   落在不同的时间样点上，道变成一排插值脉冲（相邻脉冲间是 0），`|F m|` 的谱在 `v/(2dz)` 处有复制。
-   Madagascar `sfkirmod`/`sfpreconstkirch` 用 `aastretch`（按局部拉伸率 `dt/dz` 加宽的三角滤波，与
-   第 8 节同一个双重积分技巧）处理。现在的办法是要求用户取 `dz ≤ v·dt/2`；正确做法是在正演里按
-   `|dτ/dz|·dz/dt` 选三角半宽——可以复用 AA 路径的 3/6 抽头机制，只是宽度改由深度方向的走时差分决定。
+5. ~~**正演的拉伸抗假频**~~ 已完成（0.2.0，第 8 节 `aa_stretch`）。
 6. **小项**：数据时间原点 `t0`（`sfkirmig` 的 `tau`）；fold 归一化（`sfmig2` 的 `normalize`，
    `op.adjoint(ones)` 就是照明度，可加 helper）；带符号偏移距。
 

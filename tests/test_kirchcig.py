@@ -148,6 +148,106 @@ def test_gradient_velocity_operator_dot_test():
     assert abs(ang[0, int(srcs[0, 0] / 10.0), 20]) < np.radians(3.0)
 
 
+# --------------------------------------------------------------- aa_stretch
+def test_aa_stretch_smooths_coarse_depth_grid_demigration():
+    """With 2 dz / v = 5 dt every depth sample lands five time samples apart and
+    the demigrated trace is a comb; the image-cell term spreads each cell over
+    its footprint. Compared with a fine-grid reference (2 dz / v = dt) the
+    misfit must drop and the spectral replica at v / (2 dz) must vanish."""
+    from kirchcig._operator import ricker
+    v, dx, nx = 2000.0, 10.0, 101
+    nr, nt, dt, f0, zr = 51, 501, 0.001, 25.0, 200.0
+    srcs = np.stack([[500.0], [0.0]])
+    recs = np.stack([np.linspace(0, 1000, nr), np.zeros(nr)])
+
+    def demig(dz, nz, **kw):
+        op = KirchhoffCIG(nx=nx, nz=nz, dx=dx, dz=dz, srcs=srcs, recs=recs, nt=nt, dt=dt,
+                          vel=v, nh=1, engine="numpy", aa=True, aa_max=64, aperture=60.0, **kw)
+        z = np.arange(nz) * dz
+        m = np.zeros(op.shape_model, np.float32)
+        m[0] = ricker(2 * (z - zr) / v, f0)[None, :]
+        return op.forward(m)[0, nr // 2] * dz           # cell sum ~ dz * integral
+
+    ref = demig(1.0, 401)
+    comb = demig(5.0, 81, aa_stretch=False)
+    smooth = demig(5.0, 81, aa_stretch=True)
+    misfit = lambda a: np.linalg.norm(a - ref) / np.linalg.norm(ref)
+    f = np.fft.rfftfreq(nt, dt)
+    replica = lambda a: np.abs(np.fft.rfft(a))[np.argmin(abs(f - 175.0))]
+    print(f"misfit comb {misfit(comb):.3f} stretch {misfit(smooth):.3f}; "
+          f"175 Hz replica comb {replica(comb):.2f} stretch {replica(smooth):.2f} ref {replica(ref):.2f}")
+    assert misfit(smooth) < 0.5 * misfit(comb)
+    assert misfit(smooth) < 0.15                        # the rest is the triangle's ~10% loss at 25 Hz
+    assert replica(smooth) < 0.05 * replica(comb)
+
+
+def test_aa_stretch_cell_term_vanishes_at_specular_point():
+    """Source and receiver lateral gradients cancel below the midpoint, so the
+    cell footprint there is only the depth term |dtau/dz| dz = 2 dz / v."""
+    from kirchcig._engine_numpy import aa_cell
+    op = KirchhoffCIG.demo(engine="numpy", aa=True)
+    s, r = 3, 20
+    xm = 0.5 * (op.srcs[0, s] + op.recs[0, r])
+    ix = int(round((xm - op.ox) / op.dx))
+    cell = aa_cell(op._grd_s[s, ix], op._grd_r[r, ix], op.dx / op.dt, op.dz / op.dt)   # (nz,)
+    depth_only = 2.0 * op.dz / (op._demo["v"] * op.dt)
+    assert np.allclose(cell[5:], depth_only, rtol=0.15)   # deeper points: rays nearly vertical, x-term small
+    assert op.aa_widths().min() >= int(depth_only)         # the coarse demo grid always spreads by >= 2 dz / v
+
+
+# ------------------------------------------------------------------ weights
+def test_weight_presets_match_their_formulas():
+    op = KirchhoffCIG.demo(engine="numpy", nh=1, weight=["obliquity", "spreading"])
+    ws, wr = op.weights
+    assert ws.shape == op.trav_srcs.shape and wr.shape == op.trav_recs.shape
+    theta = np.arctan2(op.x[None, :, None] - op.srcs[0][:, None, None],
+                       op.z[None, None, :] - op.srcs[1][:, None, None])
+    expect = np.sqrt(np.maximum(np.cos(theta), 0)) / np.sqrt(np.maximum(op.trav_srcs, op.dt))
+    assert np.allclose(ws, expect, rtol=1e-5, atol=1e-6)
+    with pytest.raises(ValueError):
+        KirchhoffCIG.demo(engine="numpy", weight="bogus")
+    with pytest.raises(ValueError):
+        KirchhoffCIG.demo(engine="numpy", weight=(np.ones((2, 3, 4)), np.ones((2, 3, 4))))
+
+
+def test_weighted_forward_of_a_spike_is_the_unweighted_one_scaled():
+    """For a single image point the weight is one number per trace,
+    w_s(s, ip) * w_r(r, ip): the weighted operator is the plain one scaled."""
+    plain = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=1)
+    for weight in ("obliquity", ["obliquity", "spreading"], lambda t, th, dt: 1.0 + t):
+        wop = plain._clone(weight=weight)
+        ws, wr = wop.weights
+        ix, iz = 25, 15
+        spike = np.zeros(plain.shape_model, np.float32); spike[0, ix, iz] = 1.0
+        scale = (ws[:, ix, iz][:, None] * wr[:, ix, iz][None, :])[..., None]
+        assert _rel(wop.forward(spike), plain.forward(spike) * scale) < 1e-6
+        assert wop.dot_test()
+
+
+def test_obliquity_weight_is_cos_theta_on_the_zero_offset_circle():
+    """One trace with source and receiver at the same point migrates to a
+    circle; the obliquity product there is cos(theta) exactly."""
+    v, nx, nz, dx, dz, nt, dt = 2000.0, 81, 41, 10.0, 10.0, 201, 0.002
+    pos = np.stack([[400.0], [0.0]])
+    kw = dict(nx=nx, nz=nz, dx=dx, dz=dz, srcs=pos, recs=pos, nt=nt, dt=dt, vel=v, nh=1,
+              engine="numpy", aa=False)
+    plain = KirchhoffCIG(**kw)
+    obl = KirchhoffCIG(weight="obliquity", **kw)
+    d = np.zeros(plain.shape_data, np.float32); d[0, 0, 100] = 1.0        # t = 0.2 s -> radius 200 m
+    a, b = plain.adjoint(d)[0], obl.adjoint(d)[0]
+    theta = np.arctan2(plain.x[:, None] - 400.0, plain.z[None, :])
+    on = np.abs(a) > 0.3 * np.abs(a).max()
+    assert on.sum() > 20
+    assert np.allclose(b[on] / a[on], np.cos(theta[on]), atol=1e-5)
+
+
+def test_weights_compose_with_aa_and_halfderiv():
+    op = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=4, hmax=400.0, weight="obliquity",
+                           aa=True, halfderiv=True, aperture=60.0)
+    ok, err = op.dot_test(return_error=True)
+    assert ok and err < 1e-6, err
+
+
 # ----------------------------------------------------------------- aperture
 def test_aperture_mask_geometry():
     from kirchcig import aperture_mask
@@ -427,6 +527,21 @@ def test_cuda_halfderiv_matches_numpy():
 
 
 @needs_cuda
+@pytest.mark.parametrize("kw", [dict(weight="obliquity"),
+                                dict(weight=["obliquity", "spreading"], aa=True),
+                                dict(weight="spreading", domain="angle", nh=12, hmax=50.0, aa=True)])
+def test_cuda_weights_match_numpy(kw):
+    op_c = KirchhoffCIG.demo(engine="cuda", **SMALL, **kw)
+    op_n = op_c._clone(engine="numpy")
+    d = op_c.demo_data()
+    assert _rel(op_c.adjoint(d), op_n.adjoint(d)) < 1e-5
+    x = np.random.default_rng(0).standard_normal(op_c.shape_model, dtype=np.float32)
+    assert _rel(op_c.forward(x), op_n.forward(x)) < 1e-5
+    ok, err = op_c.dot_test(return_error=True)
+    assert ok and err < 1e-6, err
+
+
+@needs_cuda
 def test_cuda_aa_output_is_plain_float32_trace():
     op = KirchhoffCIG.demo(engine="cuda", aa=True, **SMALL)
     x = np.random.default_rng(0).standard_normal(op.shape_model, dtype=np.float32)
@@ -526,9 +641,13 @@ def test_aa_sums_source_and_receiver_dips():
     """Lumley, Claerbout and Bevc (1994) eq. 4 and sfmig2's tx expression add
     the two sides; taking the larger of them would under-filter."""
     from kirchcig._engine_numpy import aa_width
-    n_both = aa_width(np.float32(5e-4), np.float32(5e-4), np.float32(2e4), 999)
-    n_one = aa_width(np.float32(5e-4), np.float32(0.0), np.float32(2e4), 999)
+    n_both = aa_width(np.float32(5e-4) + np.float32(5e-4), np.float32(2e4), np.float32(0), 1.0, 999)
+    n_one = aa_width(np.float32(5e-4) + np.float32(0.0), np.float32(2e4), np.float32(0), 1.0, 999)
     assert int(n_both) - 1 == 2 * (int(n_one) - 1)
+    # the cell term combines as an RMS and aa_factor scales the whole width
+    n_rms = aa_width(np.float32(1e-3), np.float32(2e4), np.float32(15.0), 1.0, 999)   # sqrt(20^2+15^2)=25
+    assert int(n_rms) == 26
+    assert int(aa_width(np.float32(1e-3), np.float32(2e4), np.float32(15.0), 2.0, 999)) == 51
 
 
 def test_aa_suppresses_operator_aliasing():

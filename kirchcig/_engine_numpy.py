@@ -48,27 +48,48 @@ def angle_bin(ths, thr, ihd, hmax_rad, nh):
     return np.where(h >= nh, np.where(g > _F32(hmax_rad), -1, nh - 1), h).astype(np.int32)
 
 
-def aa_width(dip_s, dip_r, aaf, nmax):
+def aa_width(dip, aaf, cell, aa_factor, nmax):
     """Triangle half-width in samples, mirroring ``kc_aa_width`` in the CUDA
     source.
 
-    ``n = clip(round((dip_s + dip_r) * aaf + 1), 1, nmax)``, where
-    ``aaf = aa_factor * drho / dt`` carries the effective trace spacing of the
-    (source, receiver) pair. Source and receiver dips are *summed*, following
-    Lumley, Claerbout and Bevc (1994) eq. 4 and the ``tx`` expression in
-    Madagascar's ``sfmig2``; the trailing ``+1`` is their ``+dt``, which keeps
-    the triangle at least one sample wide. ``n == 1`` is the identity.
+    ``n = clip(round(aa_factor * sqrt((dip * aaf)^2 + cell^2) + 1), 1, nmax)``
 
-    Operation order matters for the bit-for-bit match with the kernel: the sum
-    and the product are float32, then 1.5 is added in float64 (exact) and the
-    result truncated. Rounding the product to float32 before the add is what
-    the kernel does as well; a float32 ``x + 1.5f`` would be a candidate for
-    FMA contraction on the GPU and could land on a different integer.
+    ``dip = dip_s + dip_r`` [s/m] is the operator dip along the trace axis and
+    ``aaf = drho / dt`` the effective trace spacing of the (source, receiver)
+    pair in samples per s/m, so ``dip * aaf`` is the time shift between
+    neighbouring traces in samples (Lumley, Claerbout and Bevc 1994 eq. 4;
+    ``sfmig2``'s ``tx``). ``cell`` is the time footprint of the image cell in
+    samples, see :func:`aa_cell`; the two are independent smearings of the
+    same trace and combine as a root mean square (LCB eq. 5, same reasoning).
+    The trailing ``+1`` is Madagascar's ``+dt``: the linear interpolation is
+    itself a one-sample triangle. ``n == 1`` is the identity.
+
+    Operation order matters for the bit-for-bit match with the kernel, which
+    uses ``__fmul_rn`` / ``__fadd_rn`` so nothing is fused into an FMA:
+    every product and sum is rounded to float32 exactly as NumPy does here,
+    then 1.5 is added in float64 (exact) and the result truncated.
     """
-    d = np.asarray(dip_s, dtype=_F32) + np.asarray(dip_r, dtype=_F32)
-    x = d * np.asarray(aaf, dtype=_F32)
-    n = (x.astype(np.float64) + 1.5).astype(np.int32)
+    a = np.asarray(dip, dtype=_F32) * np.asarray(aaf, dtype=_F32)
+    b = np.asarray(cell, dtype=_F32)
+    w = _F32(aa_factor) * np.sqrt(a * a + b * b, dtype=_F32)
+    n = (w.astype(np.float64) + 1.5).astype(np.int32)
     return np.clip(n, 1, nmax).astype(np.int32)
+
+
+def aa_cell(gs, gr, dxdt, dzdt):
+    """Time footprint of one image cell on the trace, in samples, mirroring
+    ``kc_aa_cell`` in the CUDA source: ``|gx_s + gx_r| dx/dt + |gz_s + gz_r|
+    dz/dt`` with ``g*`` the traveltime gradients [s/m] of the two tables
+    (``(..., 2)`` arrays, last axis ``(d/dx, d/dz)``). The gradients are
+    summed *before* the absolute value: at the specular point the source and
+    receiver lateral derivatives cancel and the footprint must be small
+    there. Zero ``dxdt``/``dzdt`` switch the term off.
+    """
+    gs = np.asarray(gs, dtype=_F32)
+    gr = np.asarray(gr, dtype=_F32)
+    bx = np.abs(gs[..., 0] + gr[..., 0]) * _F32(dxdt)
+    bz = np.abs(gs[..., 1] + gr[..., 1]) * _F32(dzdt)
+    return bx + bz
 
 
 class NumpyEngine:
@@ -84,11 +105,19 @@ class NumpyEngine:
     tabs_a, tabr_a : (ns, npts), (nr, npts) float32 emergence angles [rad]
     ihd, hmax_rad : nh / hmax_rad and hmax in radians (angle domain)
     aa : bool, anti-alias filtering
-    tabs_d, tabr_d : (ns, npts), (nr, npts) float32 traveltime shift per
-        adjacent trace [s]
-    aaf : (ns, nr) float32, ``aa_factor * drho / dt`` per trace, where ``drho``
-        is the effective trace spacing of that source/receiver pair
+    tabs_d, tabr_d : (ns, npts), (nr, npts) float32 operator dip along the
+        trace axis [s/m]
+    aaf : (ns, nr) float32, ``drho / dt`` per trace (effective trace spacing
+        of that source/receiver pair, in samples per s/m)
+    aa_factor : dimensionless scale of the whole filter width
     aa_max : largest triangle half-width in samples
+    tabs_g, tabr_g : (ns, npts, 2), (nr, npts, 2) float32 traveltime gradients
+        (d/dx, d/dz) [s/m], or None to leave the image-cell term out
+    dxdt, dzdt : ``dx / dt``, ``dz / dt``: cell size in samples per s/m
+    tabs_w, tabr_w : (ns, npts), (nr, npts) float32 per-side amplitude
+        weights, or None; every contribution is multiplied by
+        ``float32(w_s * w_r)`` (converted to the accumulator type), exactly
+        as the kernels do
     chunk_elems : receiver block size is chosen so that a (block, npts) float32
         work array has about this many elements
     """
@@ -97,7 +126,9 @@ class NumpyEngine:
 
     def __init__(self, tabs_t, tabr_t, hbin, nh, nt, idt, *, angle=False,
                  tabs_a=None, tabr_a=None, ihd=0.0, hmax_rad=0.0,
-                 aa=False, tabs_d=None, tabr_d=None, aaf=0.0, aa_max=32,
+                 aa=False, tabs_d=None, tabr_d=None, aaf=0.0, aa_factor=1.0, aa_max=32,
+                 tabs_g=None, tabr_g=None, dxdt=0.0, dzdt=0.0,
+                 tabs_w=None, tabr_w=None,
                  chunk_elems=1 << 22, **_ignored):
         self.tabs_t = np.ascontiguousarray(tabs_t, dtype=np.float32)
         self.tabr_t = np.ascontiguousarray(tabr_t, dtype=np.float32)
@@ -117,17 +148,28 @@ class NumpyEngine:
             self.tabs_d = np.ascontiguousarray(tabs_d, dtype=np.float32)
             self.tabr_d = np.ascontiguousarray(tabr_d, dtype=np.float32)
             self.aaf = np.ascontiguousarray(aaf, dtype=np.float32)
+            self.aa_factor = float(aa_factor)
             self.aa_max = int(aa_max)
+            self.stretch = tabs_g is not None
+            if self.stretch:
+                self.tabs_g = np.ascontiguousarray(tabs_g, dtype=np.float32)
+                self.tabr_g = np.ascontiguousarray(tabr_g, dtype=np.float32)
+                self.dxdt, self.dzdt = float(dxdt), float(dzdt)
             self.pad = self.aa_max + 1              # D index of time sample 0
             self.npadded = self.nt + 2 * self.aa_max + 1
+        self.weighted = tabs_w is not None
+        if self.weighted:
+            self.tabs_w = np.ascontiguousarray(tabs_w, dtype=np.float32)
+            self.tabr_w = np.ascontiguousarray(tabr_w, dtype=np.float32)
         self.rchunk = max(1, int(chunk_elems) // max(self.npts, 1))
 
     # ------------------------------------------------------------------ core
     def _pairs(self, s, r0, r1):
         """Valid (receiver, image point) pairs for source ``s`` and receivers
         ``r0:r1``. Returns local receiver index, image point, time sample,
-        float32 weight of the second tap, the gather bin, and the triangle
-        half-width (``None`` when anti-aliasing is off)."""
+        float32 weight of the second tap, the gather bin, the triangle
+        half-width (``None`` when anti-aliasing is off) and the float64
+        amplitude weight (``None`` when unweighted)."""
         t = (self.tabs_t[s][None, :] + self.tabr_t[r0:r1]) * self.idt32
         it = np.floor(t).astype(np.int32)
         w = t - it.astype(np.float32)
@@ -143,9 +185,17 @@ class NumpyEngine:
         rr, pp = np.nonzero(valid)
         n = None
         if self.aa:
-            n = aa_width(self.tabs_d[s][None, :], self.tabr_d[r0:r1],
-                         self.aaf[s, r0:r1][:, None], self.aa_max)[rr, pp]
-        return rr, pp, it[rr, pp], w[rr, pp], h[rr, pp], n
+            dip = self.tabs_d[s][None, :] + self.tabr_d[r0:r1]
+            cell = _F32(0.0)
+            if self.stretch:
+                cell = aa_cell(self.tabs_g[s][None, :], self.tabr_g[r0:r1],
+                               self.dxdt, self.dzdt)
+            n = aa_width(dip, self.aaf[s, r0:r1][:, None], cell,
+                         self.aa_factor, self.aa_max)[rr, pp]
+        wt = None
+        if self.weighted:
+            wt = (self.tabs_w[s][None, :] * self.tabr_w[r0:r1])[rr, pp].astype(np.float64)
+        return rr, pp, it[rr, pp], w[rr, pp], h[rr, pp], n, wt
 
     @staticmethod
     def _taps(w32):
@@ -183,7 +233,7 @@ class NumpyEngine:
             ds = data[s]
             for r0 in range(0, self.nr, self.rchunk):
                 r1 = min(self.nr, r0 + self.rchunk)
-                rr, pp, itv, wv, hv, nv = self._pairs(s, r0, r1)
+                rr, pp, itv, wv, hv, nv, wt = self._pairs(s, r0, r1)
                 if rr.size == 0:
                     continue
                 w1, w2 = self._taps(wv)
@@ -201,6 +251,8 @@ class NumpyEngine:
                 else:
                     v = ds[rg, itv].astype(np.float64) * w1 \
                         + ds[rg, itv + 1].astype(np.float64) * w2
+                if wt is not None:
+                    v = wt * v
                 idx = hv.astype(np.int64) * self.npts + pp
                 acc += np.bincount(idx, weights=v, minlength=nbins)
         return acc.reshape(self.nh, self.npts).astype(np.float32)
@@ -217,11 +269,13 @@ class NumpyEngine:
             for r0 in range(0, self.nr, self.rchunk):
                 r1 = min(self.nr, r0 + self.rchunk)
                 rc = r1 - r0
-                rr, pp, itv, wv, hv, nv = self._pairs(s, r0, r1)
+                rr, pp, itv, wv, hv, nv, wt = self._pairs(s, r0, r1)
                 if rr.size == 0:
                     continue
                 w1, w2 = self._taps(wv)
                 v = mflat[hv.astype(np.int64) * self.npts + pp]
+                if wt is not None:
+                    v = v * wt
                 if self.aa:
                     n64 = nv.astype(np.float64)
                     v = v / (n64 * n64)

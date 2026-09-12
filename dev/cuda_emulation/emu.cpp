@@ -50,6 +50,9 @@ static inline float atomicAdd(float* p, float v) {
     } while (old != assumed);
     std::memcpy(&f, &old, 4); return f;
 }
+// round-to-nearest intrinsics: plain ops here (-std=c++17 => -ffp-contract=off, no FMA on baseline x86-64)
+static inline float __fadd_rn(float a, float b) { return a + b; }
+static inline float __fmul_rn(float a, float b) { return a * b; }
 static inline long long __double_as_longlong(double d) { long long l; std::memcpy(&l, &d, 8); return l; }
 static inline double __longlong_as_double(long long l) { double d; std::memcpy(&d, &l, 8); return d; }
 using std::min;
@@ -75,25 +78,29 @@ static void launch(unsigned gx, unsigned gy, unsigned block, F body) {
 
 // Launchers: the Python side supplies the grid exactly as it would to CuPy.
 extern "C" void launch_kirch_adjoint(unsigned gx, unsigned gy, unsigned block,
-        const void* data, const void* tab_s, const void* tab_r, const int* hbin, const float* aaf,
-        void* out, int ns, int nr, int nt, int npts, int s_per_split,
-        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad) {
+        const void* data, const void* tab_s, const void* tab_r, const void* grd_s, const void* grd_r,
+        const int* hbin, const float* aaf, void* out, int ns, int nr, int nt, int npts, int s_per_split,
+        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad,
+        float aa_factor, float dxdt, float dzdt) {
     if (block != BLOCK) { fprintf(stderr, "block mismatch %u != %d\n", block, BLOCK); abort(); }
     launch(gx, gy, BLOCK, [&] {
-        kirch_adjoint((const din_t*)data, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
+        kirch_adjoint((const din_t*)data, (const tab_t*)tab_s, (const tab_t*)tab_r,
+                      (const grad_t*)grd_s, (const grad_t*)grd_r, hbin, aaf,
                       (OUT*)out, ns, nr, nt, npts, s_per_split, npad, pad, aa_max,
-                      idt, ihd, hmax_rad);
+                      idt, ihd, hmax_rad, aa_factor, dxdt, dzdt);
     });
 }
 extern "C" void launch_kirch_forward(unsigned gx, unsigned gy, unsigned block,
-        const float* model, const void* tab_s, const void* tab_r, const int* hbin, const float* aaf,
-        void* data, int ns, int nr, int nt, int npts, int tchunk,
-        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad) {
+        const float* model, const void* tab_s, const void* tab_r, const void* grd_s, const void* grd_r,
+        const int* hbin, const float* aaf, void* data, int ns, int nr, int nt, int npts, int tchunk,
+        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad,
+        float aa_factor, float dxdt, float dzdt) {
     if (block != FBLOCK) { fprintf(stderr, "fblock mismatch %u != %d\n", block, FBLOCK); abort(); }
     if (tchunk > TCHUNK_MAX) { fprintf(stderr, "tchunk too large\n"); abort(); }
     launch(gx, gy, FBLOCK, [&] {
-        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
+        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r,
+                      (const grad_t*)grd_s, (const grad_t*)grd_r, hbin, aaf,
                       (dout_t*)data, ns, nr, nt, npts, tchunk, npad, pad, aa_max,
-                      idt, ihd, hmax_rad);
+                      idt, ihd, hmax_rad, aa_factor, dxdt, dzdt);
     });
 }

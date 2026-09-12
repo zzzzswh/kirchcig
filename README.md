@@ -111,6 +111,7 @@ Kirchhoff summation aliases wherever the operator's moveout between neighbouring
 
 - `aa_factor` scales the filter width and is the `antialias=` parameter of `trimo` and `sfmig2` (all default to 1.0). 2.0 puts the triangle's first spectral null exactly on the alias frequency, at the cost of resolution on steep dips.
 - `aa_max` caps the half-width in samples (default 32).
+- `aa_stretch` (default on) also covers the time footprint of the image cell, `|dtau/dx| dx + |dtau/dz| dz`. An image sample stands for a `dx * dz` cell; when the depth grid is coarser than the time sampling (`2 dz / v > dt`) each depth sample of a plain summation lands several time samples apart and a demigrated reflector is a comb of interpolated spikes. This is Madagascar's `aastretch`. The source and receiver gradients are summed before the absolute value, so the footprint is only the depth term at the specular point, and the two widths combine as a root mean square. It costs one extra 8-byte gradient-table read per contribution; `aa_stretch=False` gives the pure trace-axis criterion of `sfmig2`.
 - Operator dips come from differencing the traveltime tables along the trace axis, so it works for eikonal and user-supplied tables alike. The source and receiver axes must be sorted along the line; the constructor warns otherwise.
 - The operator pair stays an exact transpose; `dot_test()` passes with the filter on.
 - Cost: the filter is applied through a three-tap identity on the double integral of the traces, so the price does not depend on the filter width. It does need a float64 copy of the data, `ns * nr * (nt + 2*aa_max + 1) * 8` bytes, and the adjoint reads three float64 taps per contribution instead of one float32 sample. On a V100 that is 1.9x on the adjoint and 2.6x on the forward (see Performance); `python benchmarks/bench.py --aa` measures it on yours.
@@ -126,6 +127,17 @@ A trace contributes to an image point only if the point lies inside the aperture
 
 The aperture is applied on the host by pushing the masked traveltime-table entries past the end of the trace, where the kernels already skip. No kernel changes, both engines drop exactly the same contributions, and the pair stays an exact transpose.
 
+### Amplitude weights
+
+```python
+op = KirchhoffCIG(..., weight="obliquity")                     # sqrt(cos theta) per side
+op = KirchhoffCIG(..., weight=["obliquity", "spreading"])      # times 1/sqrt(t) per side
+op = KirchhoffCIG(..., weight=lambda t, theta, dt: np.cos(theta) ** 2)
+op = KirchhoffCIG(..., weight=(w_srcs, w_recs))                # (ns, nx, nz), (nr, nx, nz)
+```
+
+Every contribution is multiplied by `w_s(src, x, z) * w_r(rec, x, z)`, the product of a source-side and a receiver-side table. Presets are `"obliquity"` (`sqrt(cos theta)`, the product is the geometric mean of the two emergence cosines, the obliquity factor of Kirchhoff modelling; `sfkirmod` uses the arithmetic mean, which agrees to second order) and `"spreading"` (`1 / sqrt(t)`, the 2D Green's function amplitude of one leg up to the velocity); a list multiplies them; a callable is evaluated on each side's traveltime and emergence-angle tables; a pair of arrays is used as is. Both kernels multiply by the same float32 product, so `forward` is `A W`, `adjoint` is `W A^T` and the pair stays an exact transpose. The weight rides in the traveltime-table element, so it costs no extra memory transaction. These cover the obliquity and spreading factors; the full true-amplitude (Bleistein) weights are not separable into two sides and are not provided.
+
 ### Half-derivative (rho) filter
 
 ```python
@@ -134,7 +146,7 @@ op = KirchhoffCIG(..., halfderiv=True)
 
 Kirchhoff demigration in 2D needs a half-order time derivative. Spreading each image point along its traveltime curve and summing the spread points over a reflector leaves the stationary-phase factor of the one lateral integral behind: a 45-degree phase rotation and an `|omega|^-1/2` spectral tilt. A demigrated horizontal reflector then does not return the wavelet it was built with, and a migrated one carries the rotation the other way. `halfderiv=True` applies `H(omega) = sqrt(1 - rho e^{-i omega})`, the half of the backward difference, to every trace on the way out of `forward` and its exact transpose to the data on the way into `adjoint`. It is the filter Madagascar's `sf_halfint` implements and `sfmig2`, `sfkirchnew` and `sfkirmod` apply, with the same default leak `rho = 1 - 1/nt`; `halfderiv_rho` changes it.
 
-It costs one float64 FFT per trace, runs on the engine's device, and is independent of the kernels. `dot_test()` passes with it on. Two properties to know: the discrete filter delays by a quarter sample (its phase is `pi/4 - omega/4`), so migrated reflectors sit `dt/4` shallower in two-way time and round trips are unshifted; and the depth grid must resolve the time sampling (`2 dz / v <= dt`) or the demigrated traces are combs of spikes, with or without the filter.
+It costs one float64 FFT per trace, runs on the engine's device, and is independent of the kernels. `dot_test()` passes with it on. Two properties to know: the discrete filter delays by a quarter sample (its phase is `pi/4 - omega/4`), so migrated reflectors sit `dt/4` shallower in two-way time and round trips are unshifted; and it does nothing about the depth-grid comb (`2 dz / v > dt`), which is what `aa=True` handles.
 
 ### PyTorch
 
@@ -191,13 +203,14 @@ Single **Tesla V100-PCIE-32GB** (driver 580.178.04), `nx=401, nz=201, ns=100, nr
 |---|---|---|---|
 | `float64` (default) | 52.9 ms — 30.5 G pair-evals/s | 25.5 ms — 63.2 G pair-evals/s | 9.5e-08 |
 | `float32` | 33.5 ms — 48.2 G pair-evals/s | 18.8 ms — 85.8 G pair-evals/s | 1.1e-07 |
-| `float64`, `aa=True` | 98.5 ms — 16.4 G pair-evals/s | 67.4 ms — 23.9 G pair-evals/s | 2.0e-08 |
+| `float64`, `aa=True, aa_stretch=False` | 77.3 ms — 20.8 G pair-evals/s | 67.3 ms — 23.9 G pair-evals/s | 2.0e-08 |
+| `float64`, `aa=True` (with `aa_stretch`) | 128.8 ms — 12.5 G pair-evals/s | 72.0 ms — 22.4 G pair-evals/s | 2.3e-08 |
 
-Building the operator, including traveltime tables and the one-off NVRTC compile, takes about 1.4 s (2.0 s with `aa=True`, which also differences the tables for the operator dips). Anti-aliasing costs 1.9x on the adjoint (three float64 taps per contribution instead of one float32 sample) and 2.6x on the forward (six shared-memory atomics instead of two, plus the float64 output and its reverse integration). `forward` is roughly twice as fast as `adjoint`: it accumulates one trace per block in shared memory and writes it out once, while `adjoint` does an irregular gather along the traveltime curves.
+Building the operator, including traveltime tables and the one-off NVRTC compile, takes about 1.4 s (2.0 s with `aa=True`, which also differences the tables for the operator dips). Anti-aliasing costs about 1.5x on the adjoint (three float64 taps per contribution instead of one float32 sample) and 2.6x on the forward (six shared-memory atomics instead of two, plus the float64 output and its reverse integration). The default `aa_stretch` term reads one more 8-byte gradient-table element per contribution and costs another 1.7x on the adjoint, which says the adjoint is bound by table reads, not arithmetic; packing the gradients into the traveltime element is the obvious next optimisation. Timings on this machine vary by up to 25% between sessions (the `aa_stretch=False` row measured 98.5 ms on another day), so compare rows measured together. `forward` is roughly twice as fast as `adjoint`: it accumulates one trace per block in shared memory and writes it out once, while `adjoint` does an irregular gather along the traveltime curves.
 
 float64 accumulation is close to free on Volta and other data-centre cards (1:2 FP64:FP32) and buys bit-identical agreement with the NumPy reference engine. On consumer GeForce parts the ratio is about 1:64, so `acc="float32"` is the sensible default there; it costs roughly 1e-7 of relative accuracy.
 
-Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain`, `--aa`, `--aperture`, `--halfderiv` and `--engine numpy` are accepted. The first two rows are without anti-aliasing. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
+Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain`, `--aa`, `--no_aa_stretch`, `--aperture`, `--halfderiv`, `--weight` and `--engine numpy` are accepted. The first two rows are without anti-aliasing. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
 
 ## How it works
 
@@ -217,8 +230,8 @@ Large problems are handled by chunking the time axis and splitting the source ax
 
 ## Limitations
 
-- **No amplitude weights yet.** The operator is a unit-weight summation (obliquity and spreading factors are on the roadmap in `IMPLEMENTATION_NOTES.md`).
-- **The forward does not anti-alias the depth-to-time stretch.** With `2 dz / v > dt` a demigrated trace is a comb of interpolated spikes; choose `dz <= v dt / 2` (Madagascar's `sfkirmod` handles this with `aastretch`, planned).
+- **No true-amplitude weights.** `weight=` covers separable factors (obliquity, spreading, anything of the form `w_s * w_r`); the Bleistein/Schleicher weights that make the migration an inverse rather than an adjoint are not.
+- **Without `aa=True`, the forward does not anti-alias the depth-to-time stretch.** With `2 dz / v > dt` a plain demigrated trace is a comb of interpolated spikes; either choose `dz <= v dt / 2` or turn on `aa` (its `aa_stretch` term handles it).
 - **2D only.** The traveltime tables are the obstacle, not the kernels.
 - **Offset binning uses absolute half-offset**, so positive and negative offsets are not distinguished.
 

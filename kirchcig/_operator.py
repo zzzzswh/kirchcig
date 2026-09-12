@@ -9,7 +9,7 @@ import numpy as np
 from ._engine_numpy import NumpyEngine
 from ._halfderiv import HalfDerivative
 from ._traveltime import (analytic_angle, emergence_angles, image_axes,
-                          trace_dips, trace_spacing,
+                          table_gradients, trace_dips, trace_spacing,
                           traveltime_tables)
 
 _DOMAINS = ("offset", "angle")
@@ -47,6 +47,13 @@ def _check_ordered(p, name):
             stacklevel=3)
 
 
+def _is_table_pair(weight):
+    """``(w_srcs, w_recs)`` arrays, as opposed to preset names or a callable."""
+    return (isinstance(weight, (tuple, list)) and len(weight) == 2
+            and not isinstance(weight[0], str) and not callable(weight[0])
+            and np.ndim(weight[0]) == 3)
+
+
 def _resolve_engine(engine):
     if engine == "auto":
         from ._engine_cuda import cuda_available
@@ -64,6 +71,47 @@ def _sanitize_tables(trav, t_big):
     trav[~np.isfinite(trav)] = t_big
     np.clip(trav, 0.0, t_big, out=trav)
     return trav
+
+
+_WEIGHTS = {
+    # per-side factors; the operator multiplies source-side by receiver-side
+    "obliquity": lambda t, theta, dt: np.sqrt(np.maximum(np.cos(theta), 0.0)),
+    "spreading": lambda t, theta, dt: 1.0 / np.sqrt(np.maximum(t, dt)),
+}
+
+
+def weight_tables(spec, trav, theta, dt):
+    """Per-side amplitude weight table for one side, ``(n, nx, nz)`` float32.
+
+    ``spec`` is a preset name, a list of preset names (multiplied), or a
+    callable ``f(t, theta, dt) -> array`` of the traveltime table [s] and the
+    emergence angle from the vertical [rad]. Presets:
+
+    ``"obliquity"``
+        ``sqrt(cos theta)``; the product of the two sides is the geometric mean
+        of the source and receiver cosines, the obliquity factor of Kirchhoff
+        modelling (``sfkirmod`` uses the arithmetic mean ``(cos_s + cos_r)/2``;
+        the two agree to second order in the angle difference).
+    ``"spreading"``
+        ``1 / sqrt(max(t, dt))``; the 2D Green's function amplitude of one leg
+        in a homogeneous medium, ``1 / sqrt(v t)`` up to the constant. Product
+        of the sides: the geometrical spreading of the reflection.
+    """
+    if callable(spec):
+        w = spec(trav, theta, dt)
+    else:
+        names = [spec] if isinstance(spec, str) else list(spec)
+        w = np.ones(trav.shape, dtype=np.float64)
+        for name in names:
+            if name not in _WEIGHTS:
+                raise ValueError(f"unknown weight {name!r}; presets are {sorted(_WEIGHTS)}")
+            w = w * _WEIGHTS[name](trav, theta, dt)
+    w = np.asarray(w, dtype=np.float32)
+    if w.shape != trav.shape:
+        raise ValueError(f"weight must have the table shape {trav.shape}, got {w.shape}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("weights must be finite")
+    return np.ascontiguousarray(w)
 
 
 def aperture_mask(pos, x, z, aperture=None, apt=None):
@@ -136,13 +184,21 @@ class KirchhoffCIG:
         (``ns * nr * (nt + 2*aa_max + 1) * 8`` bytes) and reads three taps per
         contribution instead of one; expect the adjoint to be a few times
         slower than without it.
-    aa_factor : dimensionless multiplier on the operator dip, matching the
+    aa_factor : dimensionless multiplier on the filter width, matching the
         ``antialias`` parameter of Claerbout's ``trimo`` and Madagascar's
         ``sfmig2``, both of which default to 1.0. At 2.0 the triangle's first
         spectral null sits exactly at the alias frequency, which is the
         criterion of Lumley, Claerbout and Bevc (1994) eq. 12 and what
         Claerbout used for migration; it costs resolution on steep dips.
     aa_max : largest triangle half-width in samples (default 32)
+    aa_stretch : with ``aa=True`` (default on), also cover the time footprint
+        of the image cell, ``|dtau/dx| dx + |dtau/dz| dz``, so that a depth
+        grid coarser than the time sampling (``2 dz / v > dt``) demigrates
+        into a smooth trace instead of a comb of interpolated spikes. This is
+        Madagascar's ``aastretch``; the operator-dip and cell widths combine
+        as a root mean square. Reads one extra 8-byte gradient table entry per
+        contribution. Off, the filter is the pure trace-axis criterion of
+        ``sfmig2``.
     aperture : migration aperture as the largest angle from the vertical, in
         degrees, between an image point and the source *and* the receiver of
         a trace (``sfkirmig``'s ``aperture=``). Contributions outside the cone
@@ -152,6 +208,19 @@ class KirchhoffCIG:
         metres (``sfmig2``'s ``apt=``, in metres). ``None`` means no limit.
         Both limits may be combined; a contribution needs to pass both.
 
+    weight : amplitude weights, ``None`` (default, unit weights) or a
+        per-side factor: every contribution is multiplied by
+        ``w_s(src, x, z) * w_r(rec, x, z)``. Give a preset name
+        (``"obliquity"``: ``sqrt(cos theta)`` per side, ``"spreading"``:
+        ``1 / sqrt(t)`` per side, see :func:`weight_tables`), a list of presets
+        to multiply, a callable ``f(t, theta, dt)`` evaluated on each side's
+        traveltime and emergence-angle tables, or a pair of ready tables
+        ``(w_srcs, w_recs)`` of shapes ``(ns, nx, nz)`` and ``(nr, nx, nz)``.
+        Both kernels multiply by the same float32 product, so the pair stays
+        an exact transpose: ``forward`` is ``A W``, ``adjoint`` is ``W A^T``.
+        These are not the true-amplitude (Bleistein) weights, which are not
+        separable; they cover the obliquity and spreading factors that
+        Kirchhoff modelling codes such as ``sfkirmod`` apply.
     halfderiv : apply the half-order time derivative that 2D Kirchhoff
         demigration needs (the "rho filter", Madagascar's ``sf_halfint``):
         ``forward`` filters the demigrated traces with
@@ -171,8 +240,8 @@ class KirchhoffCIG:
     def __init__(self, nx, nz, dx, dz, srcs, recs, nt, dt, vel=None, nh=1, hmax=None,
                  domain="offset", engine="auto", trav=None, ox=0.0, oz=0.0,
                  acc="float64", block=None, split="auto", eikonal=None,
-                 aa=False, aa_factor=1.0, aa_max=32, aperture=None, apt=None,
-                 halfderiv=False, halfderiv_rho=None, _tables=None):
+                 aa=False, aa_factor=1.0, aa_max=32, aa_stretch=True, aperture=None, apt=None,
+                 halfderiv=False, halfderiv_rho=None, weight=None, _tables=None):
         self.nx, self.nz = int(nx), int(nz)
         self.dx, self.dz = float(dx), float(dz)
         self.ox, self.oz = float(ox), float(oz)
@@ -186,6 +255,7 @@ class KirchhoffCIG:
         self.aa = bool(aa)
         self.aa_factor = float(aa_factor)
         self.aa_max = int(aa_max)
+        self.aa_stretch = bool(aa_stretch) and self.aa
         if self.aa and (self.aa_factor <= 0 or self.aa_max < 1):
             raise ValueError("need aa_factor > 0 and aa_max >= 1")
         if aperture is not None:
@@ -200,6 +270,7 @@ class KirchhoffCIG:
         self.apt = None if apt is None else float(apt)
         self.halfderiv = bool(halfderiv)
         self.halfderiv_rho = halfderiv_rho
+        self.weight = weight
         self.vel = None if vel is None else (float(vel) if np.ndim(vel) == 0 else np.asarray(vel))
         if self.nh < 1:
             raise ValueError("nh must be >= 1")
@@ -236,7 +307,8 @@ class KirchhoffCIG:
         self._trav_s = _sanitize_tables(trav_s, t_big)
         self._trav_r = _sanitize_tables(trav_r, t_big)
 
-        if domain == "angle" and ang_s is None:
+        need_angles = domain == "angle" or (weight is not None and not _is_table_pair(weight))
+        if need_angles and ang_s is None:
             if const_vel is not None:
                 ang_s = analytic_angle(self.srcs, self.nx, self.nz, self.dx, self.dz, self.ox, self.oz)
                 ang_r = analytic_angle(self.recs, self.nx, self.nz, self.dx, self.dz, self.ox, self.oz)
@@ -258,6 +330,31 @@ class KirchhoffCIG:
                 dip_r = trace_dips(self._trav_r, self.recs)
         self._dip_s = None if dip_s is None else np.ascontiguousarray(dip_s, dtype=np.float32)
         self._dip_r = None if dip_r is None else np.ascontiguousarray(dip_r, dtype=np.float32)
+        grd_s = grd_r = None
+        if self.aa_stretch:
+            if _tables is not None and _tables.get("grd_s") is not None:
+                grd_s, grd_r = _tables["grd_s"], _tables["grd_r"]
+            else:
+                grd_s = table_gradients(self._trav_s, self.dx, self.dz)
+                grd_r = table_gradients(self._trav_r, self.dx, self.dz)
+        self._grd_s = None if grd_s is None else np.ascontiguousarray(grd_s, dtype=np.float32)
+        self._grd_r = None if grd_r is None else np.ascontiguousarray(grd_r, dtype=np.float32)
+
+        # -- amplitude weight tables --------------------------------------------
+        w_s = w_r = None
+        if weight is not None:
+            if _is_table_pair(weight):
+                w_s, w_r = (np.asarray(weight[0], dtype=np.float32), np.asarray(weight[1], dtype=np.float32))
+                if w_s.shape != shp_s or w_r.shape != shp_r:
+                    raise ValueError(f"weight tables must have shapes {shp_s} and {shp_r}, "
+                                     f"got {w_s.shape} and {w_r.shape}")
+                if not (np.all(np.isfinite(w_s)) and np.all(np.isfinite(w_r))):
+                    raise ValueError("weights must be finite")
+            else:
+                w_s = weight_tables(weight, self._trav_s, self._ang_s, self.dt)
+                w_r = weight_tables(weight, self._trav_r, self._ang_r, self.dt)
+        self._w_s = None if w_s is None else np.ascontiguousarray(w_s)
+        self._w_r = None if w_r is None else np.ascontiguousarray(w_r)
 
         # -- gather binning -----------------------------------------------------
         if domain == "offset":
@@ -306,8 +403,17 @@ class KirchhoffCIG:
                 aa=True,
                 tabs_d=self._dip_s.reshape(self.ns, npts),
                 tabr_d=self._dip_r.reshape(self.nr, npts),
-                aaf=self._aa_scale(), aa_max=self.aa_max,
+                aaf=self._aa_scale(), aa_factor=self.aa_factor, aa_max=self.aa_max,
             )
+            if self.aa_stretch:
+                kw.update(
+                    tabs_g=self._grd_s.reshape(self.ns, npts, 2),
+                    tabr_g=self._grd_r.reshape(self.nr, npts, 2),
+                    dxdt=self.dx / self.dt, dzdt=self.dz / self.dt,
+                )
+        if self._w_s is not None:
+            kw.update(tabs_w=self._w_s.reshape(self.ns, npts),
+                      tabr_w=self._w_r.reshape(self.nr, npts))
         if self.engine == "cuda":
             from ._engine_cuda import CudaEngine
             self._eng = CudaEngine(acc=acc, block=block, split=split, **kw)
@@ -355,31 +461,41 @@ class KirchhoffCIG:
         return (np.arange(self.nh) + 0.5) * dh
 
     def _aa_scale(self):
-        """(ns, nr) float32 ``aa_factor * drho / dt``.
+        """(ns, nr) float32 ``drho / dt``: the effective trace spacing of each
+        source/receiver pair in samples per unit operator dip.
 
-        ``drho`` is the effective trace spacing of the source/receiver pair,
-        the root-mean-square of the two axis spacings (Lumley, Claerbout and
-        Bevc 1994, eq. 5). Equal source and receiver spacings give ``drho =
-        dx``; an axis with a single trace does not contribute and does not
-        count towards the mean."""
+        ``drho`` is the root-mean-square of the two axis spacings (Lumley,
+        Claerbout and Bevc 1994, eq. 5). Equal source and receiver spacings
+        give ``drho = dx``; an axis with a single trace does not contribute
+        and does not count towards the mean. With a single source *and* a
+        single receiver the trace-axis term is zero (only the cell term of
+        ``aa_stretch`` remains)."""
         ds = trace_spacing(self.srcs)[:, None]
         dr = trace_spacing(self.recs)[None, :]
         k = (self.ns > 1) + (self.nr > 1)
         if k == 0:
-            raise ValueError("anti-aliasing needs at least two sources or two receivers")
-        rho = np.sqrt((ds ** 2 + dr ** 2) / k) * (self.aa_factor / self.dt)
+            if not self.aa_stretch:
+                raise ValueError("anti-aliasing needs at least two sources or two receivers")
+            rho = np.zeros((1, 1))
+        else:
+            rho = np.sqrt((ds ** 2 + dr ** 2) / k) / self.dt
         return np.ascontiguousarray(np.broadcast_to(rho, (self.ns, self.nr)),
                                     dtype=np.float32)
 
     def aa_widths(self):
         """(ns, nr, nx, nz) int32 triangle half-widths in samples, or None when
         anti-aliasing is off. Diagnostic only; the engines compute these on the
-        fly."""
+        fly. Memory: ``ns * nr * nx * nz * 4`` bytes."""
         if not self.aa:
             return None
-        from ._engine_numpy import aa_width
-        return aa_width(self._dip_s[:, None], self._dip_r[None, :],
-                        self._aa_scale()[:, :, None, None], self.aa_max)
+        from ._engine_numpy import aa_cell, aa_width
+        dip = self._dip_s[:, None] + self._dip_r[None, :]
+        cell = np.float32(0.0)
+        if self.aa_stretch:
+            cell = aa_cell(self._grd_s[:, None], self._grd_r[None, :],
+                           self.dx / self.dt, self.dz / self.dt)
+        return aa_width(dip, self._aa_scale()[:, :, None, None], cell,
+                        self.aa_factor, self.aa_max)
 
     def aperture_masks(self):
         """``(ns, nx, nz)`` and ``(nr, nx, nz)`` bool arrays of the image points
@@ -388,6 +504,11 @@ class KirchhoffCIG:
         x, z = image_axes(self.nx, self.nz, self.dx, self.dz, self.ox, self.oz)
         return (aperture_mask(self.srcs, x, z, self.aperture, self.apt),
                 aperture_mask(self.recs, x, z, self.aperture, self.apt))
+
+    @property
+    def weights(self):
+        """``(w_srcs, w_recs)`` per-side amplitude weight tables, or ``None``."""
+        return None if self._w_s is None else (self._w_s, self._w_r)
 
     @property
     def trav_srcs(self):
@@ -530,12 +651,14 @@ class KirchhoffCIG:
                   recs=self.recs, nt=self.nt, dt=self.dt, vel=self.vel, nh=self.nh,
                   hmax=self.hmax, domain=self.domain, ox=self.ox, oz=self.oz, acc=self.acc,
                   aa=self.aa, aa_factor=self.aa_factor, aa_max=self.aa_max,
-                  aperture=self.aperture, apt=self.apt,
+                  aa_stretch=self.aa_stretch, aperture=self.aperture, apt=self.apt,
                   halfderiv=self.halfderiv, halfderiv_rho=self.halfderiv_rho,
+                  weight=self.weight,
                   engine=self.engine if engine is None else engine,
                   _tables=dict(trav_s=self._trav_s, trav_r=self._trav_r,
                                ang_s=self._ang_s, ang_r=self._ang_r,
-                               dip_s=self._dip_s, dip_r=self._dip_r))
+                               dip_s=self._dip_s, dip_r=self._dip_r,
+                               grd_s=self._grd_s, grd_r=self._grd_r))
         kw.update(overrides)
         op = KirchhoffCIG(**kw)
         if hasattr(self, "_demo"):
@@ -546,6 +669,7 @@ class KirchhoffCIG:
         return (f"KirchhoffCIG(shape_model={self.shape_model}, shape_data={self.shape_data}, "
                 f"domain={self.domain!r}, hmax={self.hmax:g}, aa={self.aa}, "
                 f"aperture={self.aperture}, apt={self.apt}, halfderiv={self.halfderiv}, "
+                f"weight={'custom' if _is_table_pair(self.weight) else self.weight!r}, "
                 f"engine={self.engine!r})")
 
 
@@ -565,6 +689,7 @@ def migrate(data, vel, srcs, recs, dt, dx, dz, nh=1, hmax=None, domain="offset",
     aa : anti-alias filtering (``aa_factor`` and ``aa_max`` pass through)
     aperture, apt : migration aperture in degrees / metres (pass through)
     halfderiv : half-order time derivative, the 2D rho filter (pass through)
+    weight : amplitude weights, preset name(s) / callable / tables (pass through)
 
     Returns
     -------

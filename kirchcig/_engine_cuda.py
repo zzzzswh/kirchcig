@@ -28,8 +28,12 @@ the float32 input. The kernels themselves read three float64 taps per pair
 instead of one float32 sample, so expect the adjoint to be a few times slower
 than without anti-aliasing.
 
-Compilation is keyed on ``(nh, block, fblock, acc, out, angle, aa, device)``
-and cached in-process, with CuPy's on-disk cache underneath.
+With ``tabs_g``/``tabr_g`` (anti-aliased stretch, ``AAS``) the kernels read a
+second, ``float2``-sized table of traveltime gradients per pair and fold the
+image cell's time footprint into the filter width; see ``_kernels.py``.
+
+Compilation is keyed on ``(nh, block, fblock, acc, out, angle, aa, aas,
+device)`` and cached in-process, with CuPy's on-disk cache underneath.
 """
 from __future__ import annotations
 
@@ -66,9 +70,10 @@ def _device_limits():
     return sms, max(optin, _DEFAULT_SMEM)
 
 
-def _kernel(name, *, nh, block, fblock, acc, out, angle, aa, smem):
+def _kernel(name, *, nh, block, fblock, acc, out, angle, aa, aas, weight, smem):
     """Compile (or fetch from cache) one kernel specialisation."""
-    key = (name, nh, block, fblock, acc, out, int(angle), int(aa), cp.cuda.Device().id)
+    key = (name, nh, block, fblock, acc, out, int(angle), int(aa), int(aas), int(weight),
+           cp.cuda.Device().id)
     k = _KERNELS.get(key)
     if k is None:
         options = (
@@ -79,6 +84,8 @@ def _kernel(name, *, nh, block, fblock, acc, out, angle, aa, smem):
             f"-DOUT={out}",
             f"-DANGLE={int(angle)}",
             f"-DAA={int(aa)}",
+            f"-DAAS={int(aas)}",
+            f"-DWEIGHT={int(weight)}",
         )
         k = cp.RawKernel(CUDA_SOURCE, name, options=options, backend="nvrtc")
         k.compile()
@@ -129,7 +136,9 @@ class CudaEngine:
 
     def __init__(self, tabs_t, tabr_t, hbin, nh, nt, idt, *, angle=False,
                  tabs_a=None, tabr_a=None, ihd=0.0, hmax_rad=0.0,
-                 aa=False, tabs_d=None, tabr_d=None, aaf=0.0, aa_max=32,
+                 aa=False, tabs_d=None, tabr_d=None, aaf=0.0, aa_factor=1.0, aa_max=32,
+                 tabs_g=None, tabr_g=None, dxdt=0.0, dzdt=0.0,
+                 tabs_w=None, tabr_w=None,
                  acc="float64", block=None, fblock=256, split="auto",
                  split_mem_budget=256 << 20):
         if not cuda_available():
@@ -167,10 +176,20 @@ class CudaEngine:
         else:
             self.aa_max, self.pad, self.npad = 0, 0, self.nt
             self.aaf = cp.zeros(1, dtype=cp.float32)  # never dereferenced
+        self.aa_factor = np.float32(aa_factor)
+        self.aas = self.aa and tabs_g is not None
+        if self.aas:
+            self.grd_s = cp.asarray(np.ascontiguousarray(tabs_g, dtype=np.float32).reshape(self.ns, self.npts, 2))
+            self.grd_r = cp.asarray(np.ascontiguousarray(tabr_g, dtype=np.float32).reshape(self.nr, self.npts, 2))
+            self.dxdt, self.dzdt = np.float32(dxdt), np.float32(dzdt)
+        else:
+            self.grd_s = self.grd_r = cp.zeros(2, dtype=cp.float32)  # never dereferenced
+            self.dxdt = self.dzdt = np.float32(0.0)
 
         # -- tables on the device -------------------------------------------
-        self.tab_s = self._upload(tabs_t, tabs_a, tabs_d)
-        self.tab_r = self._upload(tabr_t, tabr_a, tabr_d)
+        self.weighted = tabs_w is not None
+        self.tab_s = self._upload(tabs_t, tabs_a, tabs_d, tabs_w)
+        self.tab_r = self._upload(tabr_t, tabr_a, tabr_d, tabr_w)
         self.hbin = cp.asarray(np.ascontiguousarray(hbin, dtype=np.int32).ravel())
 
         # -- adjoint configuration -------------------------------------------
@@ -188,16 +207,18 @@ class CudaEngine:
 
         # -- kernels ----------------------------------------------------------
         common = dict(nh=self.nh, block=self.block, fblock=self.fblock,
-                      acc=self.acc_ctype, angle=self.angle, aa=self.aa)
+                      acc=self.acc_ctype, angle=self.angle, aa=self.aa, aas=self.aas,
+                      weight=self.weighted)
         self._k_adj = _kernel("kirch_adjoint", out="float", smem=self.smem_adj, **common)
         self._k_fwd = _kernel("kirch_forward", out="float", smem=self.smem_fwd, **common)
         self._k_adj_partial = None  # compiled lazily, only when a split is used
         self._common = common
 
     # -------------------------------------------------------------- helpers
-    def _upload(self, t, a, d):
-        """Pack one table row-set into the kernel's ``tab_t`` layout:
-        ``float`` / ``{t, a}`` / ``{t, d}`` / ``{t, a, d, pad}``."""
+    def _upload(self, t, a, d, w):
+        """Pack one table row-set into the kernel's ``tab_t`` layout: the fields
+        ``t, a, d, w`` that are in use, in that order, padded to 1, 2 or 4
+        floats (``KC_NFIELDS`` in the kernel source)."""
         t = np.ascontiguousarray(t, dtype=np.float32)
         fields = [t]
         if self.angle:
@@ -206,9 +227,11 @@ class CudaEngine:
             fields.append(np.asarray(a, dtype=np.float32))
         if self.aa:
             fields.append(np.asarray(d, dtype=np.float32))
+        if self.weighted:
+            fields.append(np.asarray(w, dtype=np.float32))
         if len(fields) == 1:
             return cp.asarray(t)
-        width = 4 if len(fields) == 3 else 2          # keep the struct 8/16-byte aligned
+        width = 2 if len(fields) == 2 else 4          # 8- or 16-byte aligned element
         packed = np.zeros(t.shape + (width,), dtype=np.float32)
         for i, f in enumerate(fields):
             packed[..., i] = f
@@ -244,6 +267,9 @@ class CudaEngine:
     def _aa_args(self):
         return (np.int32(self.npad), np.int32(self.pad), np.int32(self.aa_max))
 
+    def _tail_args(self):
+        return (self.idt, self.ihd, self.hmax_rad, self.aa_factor, self.dxdt, self.dzdt)
+
     def _integrate(self, data):
         """Double cumulative sum of ``(ns, nr, nt)`` float32 traces onto the
         padded axis, float64. Mirrors ``NumpyEngine._integrate``."""
@@ -269,13 +295,13 @@ class CudaEngine:
         if self.aa:
             data = self._integrate(data)
         nsplit = self._nsplit()
-        tail = (*self._aa_args(), self.idt, self.ihd, self.hmax_rad)
+        tail = (*self._aa_args(), *self._tail_args())
 
         if nsplit == 1:
             out = cp.empty((self.nh, self.npts), dtype=cp.float32)
             self._k_adj(
                 (self.nblocks, 1, 1), (self.block, 1, 1),
-                (data, self.tab_s, self.tab_r, self.hbin, self.aaf, out,
+                (data, self.tab_s, self.tab_r, self.grd_s, self.grd_r, self.hbin, self.aaf, out,
                  *self._shape_args(), np.int32(self.ns), *tail),
                 shared_mem=self.smem_adj)
             return out
@@ -288,7 +314,7 @@ class CudaEngine:
         part = cp.empty((nsplit, self.nh, self.npts), dtype=self.acc_dtype)
         self._k_adj_partial(
             (self.nblocks, nsplit, 1), (self.block, 1, 1),
-            (data, self.tab_s, self.tab_r, self.hbin, self.aaf, part,
+            (data, self.tab_s, self.tab_r, self.grd_s, self.grd_r, self.hbin, self.aaf, part,
              *self._shape_args(), np.int32(s_per), *tail),
             shared_mem=self.smem_adj)
         return part.sum(axis=0, dtype=cp.float64).astype(cp.float32)
@@ -303,9 +329,9 @@ class CudaEngine:
         out = cp.empty((self.ns, self.nr, self.npad), dtype=dtype)
         self._k_fwd(
             (self.ns * self.nr, self.nchunk, 1), (self.fblock, 1, 1),
-            (model, self.tab_s, self.tab_r, self.hbin, self.aaf, out,
+            (model, self.tab_s, self.tab_r, self.grd_s, self.grd_r, self.hbin, self.aaf, out,
              *self._shape_args(), np.int32(self.tchunk),
-             *self._aa_args(), self.idt, self.ihd, self.hmax_rad),
+             *self._aa_args(), *self._tail_args()),
             shared_mem=self.smem_fwd)
         if self.aa:
             full = self._reverse_integrate(out)
@@ -315,5 +341,6 @@ class CudaEngine:
 
     def __repr__(self):
         return (f"CudaEngine(nh={self.nh}, block={self.block}, fblock={self.fblock}, "
-                f"acc={self.acc}, angle={self.angle}, aa={self.aa}, "
+                f"acc={self.acc}, angle={self.angle}, aa={self.aa}, aas={self.aas}, "
+                f"weighted={self.weighted}, "
                 f"smem_adj={self.smem_adj // 1024}KB, tchunk={self.tchunk}x{self.nchunk})")
