@@ -220,6 +220,80 @@ def test_aperture_with_antialias_uses_unmasked_dips():
     assert op.dot_test()
 
 
+# ------------------------------------------------------------ half-derivative
+def test_halfderiv_filter_is_the_half_difference():
+    """Impulse response of sqrt(1 - rho z^-1) is the binomial series
+    binom(1/2, k) (-rho)^k; applying it twice is the first difference; the
+    adjoint is the exact transpose."""
+    from kirchcig import HalfDerivative
+    nt = 400
+    H = HalfDerivative(nt)
+    assert H.n >= 2 * nt
+    k = np.arange(8)
+    coef = np.array([1.0, -0.5, -0.125, -0.0625, -5 / 128, -7 / 256, -21 / 1024, -33 / 2048])
+    assert np.abs(H.kernel(8) - coef * H.rho ** k).max() < 1e-5
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(nt).astype(np.float32)
+    hh = H(H(x))
+    ref = x.astype(np.float64); ref[1:] -= H.rho * x[:-1]
+    assert _rel(hh, ref) < 1e-4
+    y = rng.standard_normal((3, nt)).astype(np.float32)
+    lhs = float(np.vdot(H(np.stack([x] * 3)), y)); rhs = float(np.vdot(np.stack([x] * 3), H(y, adj=True)))
+    assert abs(lhs - rhs) / abs(lhs) < 1e-6
+    # |H| ~ sqrt(omega) in the band, 45-degree phase minus a quarter sample
+    # (away from DC, where the leak 1 - rho = 1/nt takes over)
+    w = 2 * np.pi * np.arange(20, 80) / H.n
+    assert np.allclose(np.abs(H.spec[20:80]), np.sqrt(2 * np.sin(w / 2)), rtol=1e-2)
+    assert np.allclose(np.angle(H.spec[20:80]), np.pi / 4 - w / 4, atol=2e-2)
+
+
+def test_halfderiv_operator_dot_test():
+    op = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=4, hmax=400.0, halfderiv=True)
+    ok, err = op.dot_test(return_error=True)
+    assert ok and err < 1e-6, err
+    assert op._clone(aa=True, aperture=50.0).dot_test()
+
+
+def _wavelet_phase_and_slope(prof, ref, dsamp):
+    """Instantaneous phase at the envelope peak (degrees, folded to (-90, 90])
+    and the log-log slope of |P|/|R| over 10-50 Hz."""
+    hilbert = pytest.importorskip("scipy.signal").hilbert
+    a = hilbert(prof)
+    ipk = int(np.argmax(np.abs(a)))
+    ph = ((np.degrees(np.angle(a[ipk])) + 90) % 180) - 90
+    n = 8 * len(prof)
+    f = np.fft.rfftfreq(n, d=dsamp)
+    P, R = np.abs(np.fft.rfft(prof, n)), np.abs(np.fft.rfft(ref, n))
+    band = (f > 10) & (f < 50)
+    slope = np.polyfit(np.log(f[band]), np.log(P[band] / R[band]), 1)[0]
+    return ph, slope
+
+
+def test_halfderiv_makes_planar_reflector_modelling_zero_phase():
+    """Demigrating a horizontal reflector with a zero-phase wavelet must give
+    the same zero-phase wavelet back on the trace. The plain summation leaves
+    the stationary-phase factor |w|^-1/2 exp(-i pi/4) of the lateral integral
+    behind: -45 degrees and a -1/2 spectral slope. The half-derivative takes
+    it out (up to its quarter-sample delay, ~9 degrees at 25 Hz and 4 ms)."""
+    from kirchcig._operator import ricker
+    v, dx, dz, nx, nz = 2000.0, 10.0, 4.0, 201, 101          # 2 dz / v == dt
+    ns, nr, nt, dt, f0, zr = 21, 101, 201, 0.004, 25.0, 200.0
+    srcs = np.stack([np.linspace(0, 2000, ns), np.zeros(ns)])
+    recs = np.stack([np.linspace(0, 2000, nr), np.zeros(nr)])
+    plain = KirchhoffCIG(nx=nx, nz=nz, dx=dx, dz=dz, srcs=srcs, recs=recs, nt=nt, dt=dt,
+                         vel=v, nh=1, engine="numpy", aperture=70.0)
+    hd = plain._clone(halfderiv=True)
+    z, t = np.arange(nz) * dz, np.arange(nt) * dt
+    m = np.zeros(plain.shape_model, np.float32)
+    m[0] = ricker(2 * (z - zr) / v, f0)[None, :]
+    ref = ricker(t - 2 * zr / v, f0)
+    ph0, sl0 = _wavelet_phase_and_slope(plain.forward(m)[ns // 2, nr // 2], ref, dt)
+    ph1, sl1 = _wavelet_phase_and_slope(hd.forward(m)[ns // 2, nr // 2], ref, dt)
+    print(f"plain: {ph0:.1f} deg, w^{sl0:+.2f};  halfderiv: {ph1:.1f} deg, w^{sl1:+.2f}")
+    assert abs(ph0 + 45.0) < 10.0 and abs(sl0 + 0.5) < 0.2
+    assert abs(ph1) < 15.0 and abs(sl1) < 0.2
+
+
 # ---------------------------------------------------------------------- cuda
 needs_cuda = pytest.mark.skipif(not cuda_available(), reason="needs CuPy and a GPU")
 
@@ -338,6 +412,18 @@ def test_cuda_aperture_matches_numpy(kw):
     x = np.random.default_rng(0).standard_normal(op_c.shape_model, dtype=np.float32)
     assert _rel(op_c.forward(x), op_n.forward(x)) < 1e-5
     assert op_c.dot_test()
+
+
+@needs_cuda
+def test_cuda_halfderiv_matches_numpy():
+    op_c = KirchhoffCIG.demo(engine="cuda", **SMALL, nh=4, hmax=400.0, halfderiv=True)
+    op_n = op_c._clone(engine="numpy")
+    d = op_c.demo_data()
+    assert _rel(op_c.adjoint(d), op_n.adjoint(d)) < 1e-5
+    x = np.random.default_rng(0).standard_normal(op_c.shape_model, dtype=np.float32)
+    assert _rel(op_c.forward(x), op_n.forward(x)) < 1e-5
+    ok, err = op_c.dot_test(return_error=True)
+    assert ok and err < 1e-6, err
 
 
 @needs_cuda

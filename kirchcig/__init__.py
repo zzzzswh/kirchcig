@@ -10,6 +10,7 @@ from ._operator import KirchhoffCIG, aperture_mask, migrate
 from ._traveltime import (analytic_traveltime, eikonal_traveltime,
                           emergence_angles, traveltime_tables)
 from ._engine_numpy import NumpyEngine
+from ._halfderiv import HalfDerivative
 
 
 def cuda_available() -> bool:
@@ -25,6 +26,7 @@ __all__ = [
     "aperture_mask",
     "cuda_available",
     "NumpyEngine",
+    "HalfDerivative",
     "traveltime_tables",
     "analytic_traveltime",
     "eikonal_traveltime",

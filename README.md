@@ -122,9 +122,19 @@ op = KirchhoffCIG(..., aperture=60.0)           # cone half-angle from the verti
 op = KirchhoffCIG(..., apt=3000.0)              # or a lateral distance [m]; both may be combined
 ```
 
-A trace contributes to an image point only if the point lies inside the aperture of *both* its source and its receiver: within `aperture` degrees of the vertical below them (`sfkirmig`'s `aperture=`), or within `apt` metres laterally (`sfmig2`'s `apt=`, in metres here). This suppresses far-aperture swing noise and skips the dropped contributions' work, so it is a speed-up, not a cost: on the README geometry a 60-degree cone keeps 47% of the trace-image-point pairs, 45 degrees keeps 23% (`python benchmarks/bench.py --aperture 60` prints the fraction and the timing). The cut is hard, as in Madagascar; `op.aperture_masks()` returns the two boolean masks.
+A trace contributes to an image point only if the point lies inside the aperture of *both* its source and its receiver: within `aperture` degrees of the vertical below them (`sfkirmig`'s `aperture=`), or within `apt` metres laterally (`sfmig2`'s `apt=`, in metres here). This suppresses far-aperture swing noise and skips the dropped contributions' work. On the README geometry a 60-degree cone keeps 47% of the trace-image-point pairs (45 degrees: 23%); on the V100 that cut the forward from 25.5 to 17.2 ms while the adjoint stayed at about 55 ms, because its blocks are depth columns that straddle the cone edge, so masked lanes idle while their warp-mates gather and the coalesced table read is still made for every pair. Treat the aperture as an imaging control that comes with a forward speed-up. The cut is hard, as in Madagascar; `op.aperture_masks()` returns the two boolean masks, `python benchmarks/bench.py --aperture 60` prints the kept fraction and the timing.
 
 The aperture is applied on the host by pushing the masked traveltime-table entries past the end of the trace, where the kernels already skip. No kernel changes, both engines drop exactly the same contributions, and the pair stays an exact transpose.
+
+### Half-derivative (rho) filter
+
+```python
+op = KirchhoffCIG(..., halfderiv=True)
+```
+
+Kirchhoff demigration in 2D needs a half-order time derivative. Spreading each image point along its traveltime curve and summing the spread points over a reflector leaves the stationary-phase factor of the one lateral integral behind: a 45-degree phase rotation and an `|omega|^-1/2` spectral tilt. A demigrated horizontal reflector then does not return the wavelet it was built with, and a migrated one carries the rotation the other way. `halfderiv=True` applies `H(omega) = sqrt(1 - rho e^{-i omega})`, the half of the backward difference, to every trace on the way out of `forward` and its exact transpose to the data on the way into `adjoint`. It is the filter Madagascar's `sf_halfint` implements and `sfmig2`, `sfkirchnew` and `sfkirmod` apply, with the same default leak `rho = 1 - 1/nt`; `halfderiv_rho` changes it.
+
+It costs one float64 FFT per trace, runs on the engine's device, and is independent of the kernels. `dot_test()` passes with it on. Two properties to know: the discrete filter delays by a quarter sample (its phase is `pi/4 - omega/4`), so migrated reflectors sit `dt/4` shallower in two-way time and round trips are unshifted; and the depth grid must resolve the time sampling (`2 dz / v <= dt`) or the demigrated traces are combs of spikes, with or without the filter.
 
 ### PyTorch
 
@@ -187,7 +197,7 @@ Building the operator, including traveltime tables and the one-off NVRTC compile
 
 float64 accumulation is close to free on Volta and other data-centre cards (1:2 FP64:FP32) and buys bit-identical agreement with the NumPy reference engine. On consumer GeForce parts the ratio is about 1:64, so `acc="float32"` is the sensible default there; it costs roughly 1e-7 of relative accuracy.
 
-Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain`, `--aa`, `--aperture` and `--engine numpy` are accepted. The first two rows are without anti-aliasing. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
+Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain`, `--aa`, `--aperture`, `--halfderiv` and `--engine numpy` are accepted. The first two rows are without anti-aliasing. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
 
 ## How it works
 
@@ -207,7 +217,8 @@ Large problems are handled by chunking the time axis and splitting the source ax
 
 ## Limitations
 
-- **No half-derivative (rho) filter or amplitude weights yet.** The operator is a plain unit-weight summation; see the roadmap in `IMPLEMENTATION_NOTES.md`.
+- **No amplitude weights yet.** The operator is a unit-weight summation (obliquity and spreading factors are on the roadmap in `IMPLEMENTATION_NOTES.md`).
+- **The forward does not anti-alias the depth-to-time stretch.** With `2 dz / v > dt` a demigrated trace is a comb of interpolated spikes; choose `dz <= v dt / 2` (Madagascar's `sfkirmod` handles this with `aastretch`, planned).
 - **2D only.** The traveltime tables are the obstacle, not the kernels.
 - **Offset binning uses absolute half-offset**, so positive and negative offsets are not distinguished.
 

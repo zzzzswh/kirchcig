@@ -74,6 +74,7 @@ def install():
     cp.empty = np.empty
     cp.zeros = np.zeros
     cp.cumsum = np.cumsum
+    cp.fft = np.fft
     cp.float32, cp.float64 = np.float32, np.float64
     cp.RawKernel = RawKernel
     cp.cuda = types.SimpleNamespace(Device=_Device, runtime=_Runtime)

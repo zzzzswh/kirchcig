@@ -45,6 +45,16 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
   锥角比较写成 `|dx| ≤ (tan(ap) + 1e-9)·dz`，1e-9 的余量是因为 `tan(45°)` 在浮点里是 `1 − 1e-16`，
   不加它正好落在锥面上的点会被排除。加速来自跳过数据读取和累加；表读取和 warp 分歧仍在，
   实际提速小于被丢弃的 pair 比例（README 几何：60° 保留 47%，45° 保留 23%）。
+- **半阶导数**（`halfderiv=True`，`_halfderiv.py`）：`F = H·A`，`Fᵀ = Aᵀ·H*`，`H(ω) = sqrt(1 − ρe^{−iω})`，
+  `ρ = 1 − 1/nt`，与 Madagascar `sf_halfint(inv=true)` 相同。数据侧、与引擎无关：伴随在内核前对数据滤波，
+  正演在内核后对输出滤波，用引擎所在设备的 `rfft/irfft`（float64），道零填充到 ≥ 2·nt 的 5-smooth 长度，
+  避免尾部（~k^{-3/2}）绕回。pad–卷积–截断的转置是 pad–共轭卷积–截断，所以算子对仍是精确转置。
+  验证：脉冲响应等于二项式级数 `binom(1/2,k)(−ρ)^k`；`H·H` = 一阶差分；水平反射层反偏移（零炮检距）
+  用 Hilbert 瞬时相位测得 −44.5°、谱斜率 ω^−0.63 → 开滤波后 −9.7°、ω^−0.15。残余 −10° 是离散滤波器的
+  四分之一样点延迟（相位 `π/4 − ω/4`，后向差分半样点延迟的一半），伴随反向同量，往返无位移。
+  **注意实验教训**：用点散射体测相位是错的——所有道的曲线都精确过那个点，求和是相干的，没有驻相，
+  单位权 `Aᵀd` 本身就是零相位；45° 只出现在对反射层的横向积分里。另一个教训：深度网格粗于时间采样
+  （`2·dz/v > dt`）时正演出来的道是一排插值脉冲，谱分析全是假象，见第 10 节。
 - **精确共轭**：两个内核用**完全相同的 float32 表达式**计算 `t`、`it`、`w`，权重转成累加精度后相乘，因此 forward/adjoint 是同一稀疏矩阵的转置；差别只来自 float64 求和顺序。
 
 ## 4. GPU 内核设计（对应 README "Design notes"）
@@ -151,19 +161,15 @@ Madagascar `user/yliu/Mmig2.c` (`sfmig2`)。
 
 ## 9. 已知限制（与 README 一致）
 
-仅 2D；offset 域按绝对半炮检距分箱不区分正负；变速度走时依赖 scikit-fmm 的一阶到达；无半阶导数滤波和
-幅度权（见第 10 节）。
+仅 2D；offset 域按绝对半炮检距分箱不区分正负；变速度走时依赖 scikit-fmm 的一阶到达；无幅度权；正演不对
+深度→时间拉伸做抗假频（见第 10 节）。
 
 ## 10. 路线图：对照 Madagascar 还缺什么
 
 对照 `sfmig2`（user/yliu）、`sfkirmig`（user/llisiw，走时表驱动的叠前深度偏移，与本项目最接近）、
 `sfkirmod`、`sfkirchnew`、`sfpreconstkirch`、`sftkirmig`，按重要性排：
 
-1. **半阶导数（rho 滤波，`sf_halfint`）**。Madagascar 每个 2D Kirchhoff 程序都有：`sfmig2` 对像做
-   `halfint`，`sfkirmod` 的 Ricker 带 `order=2` 半阶导，`sfkirchnew` 有 `hd` 开关。这是 2D Kirchhoff
-   的正确相位/幅度校正，缺了它偏移子波有 45° 相位旋转和低频偏重。实现：对 `(ns, nr, nt)` 数据沿时间
-   FFT 滤波 `sqrt(1 − ρ e^{−iω})`（`ρ = 1 − 1/nt`），伴随在内核前施加、正演在内核后施加共轭滤波，
-   算子对保持精确转置。开销远小于内核。
+1. ~~**半阶导数（rho 滤波，`sf_halfint`）**~~ 已完成（0.2.0，第 3 节）：`halfderiv=True`。
 2. ~~**孔径控制**~~ 已完成（0.2.0，第 3 节）：`aperture=`（`sfkirmig`）与 `apt=`（`sfmig2`），
    主机端表掩码实现。`sfmig2` 的 `angle=`（倾角孔径，`|x| > tan(angle)·v·t` 跳过）是时间偏移的
    等价物，深度偏移里锥角已经覆盖。边缘余弦 taper 留到幅度权一起做。
@@ -172,7 +178,12 @@ Madagascar `user/yliu/Mmig2.c` (`sfmig2`)。
    两个内核共用的权表达式；出射角表已经有（angle 域），offset 域也可算。
 4. **走时表插值**。`sfkirmig` 只在 `ny` 个稀疏地表位置存表，炮检点之间 Hermite 插值。本项目每炮每检
    一张完整表，`(ns+nr)·nx·nz·4` 字节，是上实际数据的真正瓶颈。改动较大。
-5. **小项**：数据时间原点 `t0`（`sfkirmig` 的 `tau`）；fold 归一化（`sfmig2` 的 `normalize`，
+5. **正演的拉伸抗假频**（做半阶导数时发现）。正演把一列深度样点映射到时间，`2·dz/v > dt` 时每个深度样点
+   落在不同的时间样点上，道变成一排插值脉冲（相邻脉冲间是 0），`|F m|` 的谱在 `v/(2dz)` 处有复制。
+   Madagascar `sfkirmod`/`sfpreconstkirch` 用 `aastretch`（按局部拉伸率 `dt/dz` 加宽的三角滤波，与
+   第 8 节同一个双重积分技巧）处理。现在的办法是要求用户取 `dz ≤ v·dt/2`；正确做法是在正演里按
+   `|dτ/dz|·dz/dt` 选三角半宽——可以复用 AA 路径的 3/6 抽头机制，只是宽度改由深度方向的走时差分决定。
+6. **小项**：数据时间原点 `t0`（`sfkirmig` 的 `tau`）；fold 归一化（`sfmig2` 的 `normalize`，
    `op.adjoint(ones)` 就是照明度，可加 helper）；带符号偏移距。
 
 `sfkirmig` 的反假频宽度用 `max(dip_s·ds, dip_r·dh)`，`sfmig2` 用两侧之和；本项目取后者（第 8 节）。

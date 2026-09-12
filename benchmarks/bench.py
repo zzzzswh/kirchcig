@@ -1,6 +1,6 @@
 """Timing of the cuda engine on a README-sized problem.
 
-    python benchmarks/bench.py [--nh 32] [--domain offset|angle] [--acc float64] [--aa] [--aperture 60]
+    python benchmarks/bench.py [--nh 32] [--domain offset|angle] [--acc float64] [--aa] [--aperture 60] [--halfderiv]
 
 Reports wall time per adjoint / forward and the equivalent trace-image-point
 throughput (ns*nr*npts pair evaluations per second).
@@ -24,6 +24,7 @@ p.add_argument("--acc", default="float64")
 p.add_argument("--engine", default="cuda")
 p.add_argument("--aa", action="store_true", help="anti-alias filtering")
 p.add_argument("--aperture", type=float, default=None, help="migration aperture [deg]")
+p.add_argument("--halfderiv", action="store_true", help="half-derivative (rho) filter")
 p.add_argument("--reps", type=int, default=5)
 a = p.parse_args()
 
@@ -37,7 +38,7 @@ hmax = 2000.0 if a.domain == "offset" else 60.0
 t0 = time.perf_counter()
 op = KirchhoffCIG(nx=a.nx, nz=a.nz, dx=10.0, dz=10.0, srcs=srcs, recs=recs, nt=a.nt, dt=0.004,
                   vel=2000.0, nh=a.nh, hmax=hmax, domain=a.domain, engine=a.engine, acc=a.acc,
-                  aa=a.aa, aperture=a.aperture)
+                  aa=a.aa, aperture=a.aperture, halfderiv=a.halfderiv)
 print(f"build (tables + compile): {time.perf_counter() - t0:.2f} s   {op._eng!r}")
 
 xp = np

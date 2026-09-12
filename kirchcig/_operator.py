@@ -7,6 +7,7 @@ import warnings
 import numpy as np
 
 from ._engine_numpy import NumpyEngine
+from ._halfderiv import HalfDerivative
 from ._traveltime import (analytic_angle, emergence_angles, image_axes,
                           trace_dips, trace_spacing,
                           traveltime_tables)
@@ -151,6 +152,15 @@ class KirchhoffCIG:
         metres (``sfmig2``'s ``apt=``, in metres). ``None`` means no limit.
         Both limits may be combined; a contribution needs to pass both.
 
+    halfderiv : apply the half-order time derivative that 2D Kirchhoff
+        demigration needs (the "rho filter", Madagascar's ``sf_halfint``):
+        ``forward`` filters the demigrated traces with
+        ``H(w) = sqrt(1 - rho e^{-iw})``, ``adjoint`` filters the data with the
+        exact transpose ``H*`` before summing. Without it the migrated wavelet
+        is rotated by 45 degrees and weighted towards low frequencies. Cheap
+        (one FFT per trace, float64) and independent of the engine.
+    halfderiv_rho : leak of the half difference, default ``1 - 1/nt``.
+
     Both apertures are applied by pushing the masked traveltime-table entries
     beyond the trace end, where the kernels already skip them, so the two
     engines drop exactly the same contributions and the pair stays an exact
@@ -162,7 +172,7 @@ class KirchhoffCIG:
                  domain="offset", engine="auto", trav=None, ox=0.0, oz=0.0,
                  acc="float64", block=None, split="auto", eikonal=None,
                  aa=False, aa_factor=1.0, aa_max=32, aperture=None, apt=None,
-                 _tables=None):
+                 halfderiv=False, halfderiv_rho=None, _tables=None):
         self.nx, self.nz = int(nx), int(nz)
         self.dx, self.dz = float(dx), float(dz)
         self.ox, self.oz = float(ox), float(oz)
@@ -188,6 +198,8 @@ class KirchhoffCIG:
             raise ValueError("apt must be positive")
         self.aperture = aperture
         self.apt = None if apt is None else float(apt)
+        self.halfderiv = bool(halfderiv)
+        self.halfderiv_rho = halfderiv_rho
         self.vel = None if vel is None else (float(vel) if np.ndim(vel) == 0 else np.asarray(vel))
         if self.nh < 1:
             raise ValueError("nh must be >= 1")
@@ -302,6 +314,15 @@ class KirchhoffCIG:
         else:
             self._eng = NumpyEngine(**kw)
 
+        # -- half-derivative filter (data side, engine independent) -------------
+        self._hd = None
+        if self.halfderiv:
+            if self.engine == "cuda":
+                import cupy as xp
+            else:
+                xp = np
+            self._hd = HalfDerivative(self.nt, rho=halfderiv_rho, xp=xp)
+
     # --------------------------------------------------------------- shapes
     @property
     def shape_model(self):
@@ -410,6 +431,8 @@ class KirchhoffCIG:
 
         NumPy in, NumPy out; CuPy in, CuPy out (no host round-trip)."""
         arr, want_cupy = self._to_engine(data, self.shape_data, "data")
+        if self._hd is not None:
+            arr = self._hd(arr, adj=True)
         out = self._eng.adjoint(arr).reshape(self.shape_model)
         return self._from_engine(out, want_cupy)
 
@@ -417,6 +440,8 @@ class KirchhoffCIG:
         """Demigration: gathers ``(nh, nx, nz)`` -> data ``(ns, nr, nt)``."""
         arr, want_cupy = self._to_engine(cig, self.shape_model, "cig")
         out = self._eng.forward(arr.reshape(self.nh, -1)).reshape(self.shape_data)
+        if self._hd is not None:
+            out = self._hd(out)
         return self._from_engine(out, want_cupy)
 
     __call__ = forward
@@ -506,6 +531,7 @@ class KirchhoffCIG:
                   hmax=self.hmax, domain=self.domain, ox=self.ox, oz=self.oz, acc=self.acc,
                   aa=self.aa, aa_factor=self.aa_factor, aa_max=self.aa_max,
                   aperture=self.aperture, apt=self.apt,
+                  halfderiv=self.halfderiv, halfderiv_rho=self.halfderiv_rho,
                   engine=self.engine if engine is None else engine,
                   _tables=dict(trav_s=self._trav_s, trav_r=self._trav_r,
                                ang_s=self._ang_s, ang_r=self._ang_r,
@@ -519,7 +545,8 @@ class KirchhoffCIG:
     def __repr__(self):
         return (f"KirchhoffCIG(shape_model={self.shape_model}, shape_data={self.shape_data}, "
                 f"domain={self.domain!r}, hmax={self.hmax:g}, aa={self.aa}, "
-                f"aperture={self.aperture}, apt={self.apt}, engine={self.engine!r})")
+                f"aperture={self.aperture}, apt={self.apt}, halfderiv={self.halfderiv}, "
+                f"engine={self.engine!r})")
 
 
 # --------------------------------------------------------------------- migrate
@@ -537,6 +564,7 @@ def migrate(data, vel, srcs, recs, dt, dx, dz, nh=1, hmax=None, domain="offset",
     nh, hmax, domain, engine, trav, ox, oz : see :class:`KirchhoffCIG`
     aa : anti-alias filtering (``aa_factor`` and ``aa_max`` pass through)
     aperture, apt : migration aperture in degrees / metres (pass through)
+    halfderiv : half-order time derivative, the 2D rho filter (pass through)
 
     Returns
     -------

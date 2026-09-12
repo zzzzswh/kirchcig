@@ -122,9 +122,19 @@ op = KirchhoffCIG(..., aperture=60.0)           # 与垂直方向的锥角半角
 op = KirchhoffCIG(..., apt=3000.0)              # 或横向距离 [m]；两者可以同时给
 ```
 
-一条道只对同时落在其炮点**和**检波点孔径内的成像点有贡献：在它们正下方 `aperture` 度的锥内（`sfkirmig` 的 `aperture=`），或横向距离不超过 `apt` 米（`sfmig2` 的 `apt=`，这里单位是米）。这既压远端摆动噪声，又跳过被丢弃贡献的计算，所以是加速而不是开销：README 那个几何下 60° 锥保留 47% 的道–成像点对，45° 保留 23%（`python benchmarks/bench.py --aperture 60` 会打印比例和计时）。和 Madagascar 一样是硬截断；`op.aperture_masks()` 返回两个布尔掩码。
+一条道只对同时落在其炮点**和**检波点孔径内的成像点有贡献：在它们正下方 `aperture` 度的锥内（`sfkirmig` 的 `aperture=`），或横向距离不超过 `apt` 米（`sfmig2` 的 `apt=`，这里单位是米）。这既压远端摆动噪声，又跳过被丢弃贡献的计算。README 那个几何下 60° 锥保留 47% 的道–成像点对（45°：23%）；V100 上正演从 25.5 ms 降到 17.2 ms，伴随则维持在 55 ms 左右——它的 block 是一段深度列，横跨锥面边缘，被掩掉的线程只能等同一 warp 里其他线程做完 gather，而且每个 pair 的合并表读取照样要做。所以把孔径当作一个附带正演加速的成像控制项来用。和 Madagascar 一样是硬截断；`op.aperture_masks()` 返回两个布尔掩码，`python benchmarks/bench.py --aperture 60` 会打印保留比例和计时。
 
 孔径在主机端施加：把被掩掉的走时表项推到道的末端之外，内核本来就会跳过那里。不改内核，两个引擎丢掉的贡献完全相同，算子对仍是精确转置。
+
+### 半阶导数（rho）滤波
+
+```python
+op = KirchhoffCIG(..., halfderiv=True)
+```
+
+2D 克希霍夫反偏移需要一个时间上的半阶导数。把每个成像点沿走时曲线铺开、再对整条反射层求和，横向那一维积分的驻相因子会留下来：45° 相位旋转和 `|ω|^-1/2` 的谱倾斜。于是反偏移出来的水平反射层还不回构造它时用的子波，偏移出来的反射层则反方向旋转。`halfderiv=True` 在 `forward` 输出的每条道上施加 `H(ω) = sqrt(1 − ρe^{−iω})`（后向差分的平方根），在 `adjoint` 读入数据时施加它的精确转置。这正是 Madagascar `sf_halfint` 实现、`sfmig2`/`sfkirchnew`/`sfkirmod` 使用的滤波器，泄漏系数默认同样是 `ρ = 1 − 1/nt`；`halfderiv_rho` 可改。
+
+代价是每道一次 float64 FFT，在引擎所在设备上运行，与内核无关。开着它 `dot_test()` 照样通过。两点要知道：离散滤波器带四分之一个样点的延迟（相位是 `π/4 − ω/4`），所以偏移出来的反射层在双程时间上浅 `dt/4`，往返一次则没有位移；深度网格要能分辨时间采样（`2·dz/v ≤ dt`），否则反偏移的道是一排插值脉冲，开不开滤波都一样。
 
 ### PyTorch
 
@@ -187,7 +197,7 @@ python benchmarks/bench.py           # 性能测试
 
 float64 累加在 Volta 及其他数据中心卡上几乎不增加开销（FP64:FP32 为 1:2），换来的是与 NumPy 参考引擎逐位一致的结果。消费级 GeForce 卡上这个比例约为 1:64，在那类卡上应默认使用 `acc="float32"`,代价约为 1e-7 的相对精度。
 
-复现：`python benchmarks/bench.py`，可接受 `--acc float32`、`--nh`、`--domain`、`--aa`、`--aperture`、`--engine numpy` 等参数。前两行是不开抗假频的结果。算子在单张卡上运行，可通过 `cupy.cuda.Device` 指定设备；使用 PyTorch 封装时则由张量所在设备决定。
+复现：`python benchmarks/bench.py`，可接受 `--acc float32`、`--nh`、`--domain`、`--aa`、`--aperture`、`--halfderiv`、`--engine numpy` 等参数。前两行是不开抗假频的结果。算子在单张卡上运行，可通过 `cupy.cuda.Device` 指定设备；使用 PyTorch 封装时则由张量所在设备决定。
 
 ## 实现
 
@@ -207,7 +217,8 @@ float64 累加在 Volta 及其他数据中心卡上几乎不增加开销（FP64:
 
 ## 已知限制
 
-- **尚无半阶导数（rho）滤波和幅度权。** 算子是单位权直接求和；后续计划见 `IMPLEMENTATION_NOTES.md`。
+- **尚无幅度权。** 算子是单位权求和（倾斜因子与几何扩散在 `IMPLEMENTATION_NOTES.md` 的路线图里）。
+- **正演不对深度→时间的拉伸做抗假频。** `2·dz/v > dt` 时反偏移的道是一排插值脉冲；请取 `dz ≤ v·dt/2`（Madagascar 的 `sfkirmod` 用 `aastretch` 处理这个问题，计划中）。
 - **仅支持 2D。** 瓶颈在走时表，不在核函数。
 - **偏移距分道集用的是半偏移距绝对值**，因此不区分正负偏移距。
 

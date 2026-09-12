@@ -23,6 +23,12 @@
   the same contributions, the pair stays an exact transpose, and the skipped
   contributions cost nothing. `aperture_masks()` diagnostic,
   `benchmarks/bench.py --aperture`.
+- Half-derivative (rho) filter, `halfderiv=True`: `H = sqrt(1 - rho e^{-iw})`
+  on the traces after `forward`, its exact transpose on the data before
+  `adjoint` (Madagascar `sf_halfint`, same default leak `1 - 1/nt`). Float64
+  FFTs on the engine's device, traces padded to >= 2 nt. Planar-reflector
+  demigration returns a zero-phase wavelet with it (-45 degrees and
+  `w^-1/2` without). `kirchcig.HalfDerivative`, `bench.py --halfderiv`.
 - `KirchhoffCIG.demo()` now forwards unknown keywords to the constructor.
 - Fixed the project URL in `pyproject.toml`.
 
