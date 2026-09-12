@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kirchcig"
+version = "0.1.0"
+description = "GPU Kirchhoff migration to common-image gathers, and its exact adjoint."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "kirchcig contributors" }]
+keywords = ["seismic", "kirchhoff", "migration", "common-image-gather", "cuda", "cupy", "adjoint", "least-squares-migration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+eikonal = ["scikit-fmm"]
+cuda12 = ["cupy-cuda12x"]
+cuda11 = ["cupy-cuda11x"]
+torch = ["torch"]
+test = ["pytest", "scipy", "scikit-fmm"]
+
+[project.urls]
+Homepage = "https://github.com/kirchcig/kirchcig"
+
+[tool.setuptools.packages.find]
+include = ["kirchcig*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.9",
+]
