@@ -14,3 +14,4 @@ dist/
 # cuda emulation build artefacts (dev/)
 lib_fake_*.so
 kernel_body.inc
+*.patch

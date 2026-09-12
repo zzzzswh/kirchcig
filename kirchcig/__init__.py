@@ -6,7 +6,7 @@
 inversion. The PyTorch wrapper lives in ``kirchcig.torch``.
 """
 from ._version import __version__
-from ._operator import KirchhoffCIG, migrate
+from ._operator import KirchhoffCIG, aperture_mask, migrate
 from ._traveltime import (analytic_traveltime, eikonal_traveltime,
                           emergence_angles, traveltime_tables)
 from ._engine_numpy import NumpyEngine
@@ -22,6 +22,7 @@ __all__ = [
     "__version__",
     "KirchhoffCIG",
     "migrate",
+    "aperture_mask",
     "cuda_available",
     "NumpyEngine",
     "traveltime_tables",

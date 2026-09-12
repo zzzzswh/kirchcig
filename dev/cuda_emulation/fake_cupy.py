@@ -43,7 +43,18 @@ class RawKernel:
         if self.name == "kirch_adjoint":
             assert shared_mem == int(m["NH"]) * int(m["BLOCK"]) * acc_bytes, "adjoint smem"
         else:
-            tchunk = int(args[9]); assert shared_mem == tchunk * acc_bytes, "forward smem"
+            facc_bytes = 8 if int(m.get("AA", "0")) else acc_bytes
+            tchunk = int(args[10]); assert shared_mem == tchunk * facc_bytes, "forward smem"
+        # the data-side buffers must have the dtype the kernel was compiled for
+        aa = int(m.get("AA", "0"))
+        if self.name == "kirch_adjoint":
+            in_dt = np.float64 if aa else np.float32
+            out_dt = np.float32 if m["OUT"] == "float" else np.float64
+        else:
+            in_dt = np.float32
+            out_dt = np.float64 if aa else np.float32
+        assert args[0].dtype == in_dt, ("input dtype", args[0].dtype, in_dt)
+        assert args[5].dtype == out_dt, ("output dtype", args[5].dtype, out_dt)
         cargs = []
         for a in args:
             if isinstance(a, np.ndarray):
@@ -61,6 +72,8 @@ def install():
     cp.asarray = lambda x, dtype=None: np.asarray(x, dtype=dtype)
     cp.ascontiguousarray = np.ascontiguousarray
     cp.empty = np.empty
+    cp.zeros = np.zeros
+    cp.cumsum = np.cumsum
     cp.float32, cp.float64 = np.float32, np.float64
     cp.RawKernel = RawKernel
     cp.cuda = types.SimpleNamespace(Device=_Device, runtime=_Runtime)

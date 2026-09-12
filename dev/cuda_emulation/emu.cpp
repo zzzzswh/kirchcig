@@ -58,7 +58,7 @@ using std::min;
 
 // dynamic shared memory definitions (extern __shared__ in the kernels)
 ACC acc[NH * BLOCK];
-ACC trace[TCHUNK_MAX];
+facc_t trace[TCHUNK_MAX];
 
 template <class F>
 static void launch(unsigned gx, unsigned gy, unsigned block, F body) {
@@ -73,45 +73,27 @@ static void launch(unsigned gx, unsigned gy, unsigned block, F body) {
     }
 }
 
-extern "C" void emu_adjoint(const float* data, const void* tab_s, const void* tab_r, const int* hbin,
-                            void* out, int ns, int nr, int nt, int npts, int nsplit,
-                            float idt, float ihd, float hmax_rad) {
-    int s_per = (ns + nsplit - 1) / nsplit;
-    nsplit = (ns + s_per - 1) / s_per;
-    unsigned gx = (npts + BLOCK - 1) / BLOCK;
-    launch(gx, nsplit, BLOCK, [&] {
-        kirch_adjoint(data, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, (OUT*)out,
-                      ns, nr, nt, npts, s_per, idt, ihd, hmax_rad);
-    });
-}
-
-extern "C" void emu_forward(const float* model, const void* tab_s, const void* tab_r, const int* hbin,
-                            float* data, int ns, int nr, int nt, int npts, int tchunk,
-                            float idt, float ihd, float hmax_rad) {
-    unsigned gy = (nt + tchunk - 1) / tchunk;
-    launch(ns * nr, gy, FBLOCK, [&] {
-        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, data,
-                      ns, nr, nt, npts, tchunk, idt, ihd, hmax_rad);
-    });
-}
-
-// Generic launchers: the Python side supplies the grid exactly as it would to CuPy.
+// Launchers: the Python side supplies the grid exactly as it would to CuPy.
 extern "C" void launch_kirch_adjoint(unsigned gx, unsigned gy, unsigned block,
-        const float* data, const void* tab_s, const void* tab_r, const int* hbin, void* out,
-        int ns, int nr, int nt, int npts, int s_per_split, float idt, float ihd, float hmax_rad) {
+        const void* data, const void* tab_s, const void* tab_r, const int* hbin, const float* aaf,
+        void* out, int ns, int nr, int nt, int npts, int s_per_split,
+        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad) {
     if (block != BLOCK) { fprintf(stderr, "block mismatch %u != %d\n", block, BLOCK); abort(); }
     launch(gx, gy, BLOCK, [&] {
-        kirch_adjoint(data, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, (OUT*)out,
-                      ns, nr, nt, npts, s_per_split, idt, ihd, hmax_rad);
+        kirch_adjoint((const din_t*)data, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
+                      (OUT*)out, ns, nr, nt, npts, s_per_split, npad, pad, aa_max,
+                      idt, ihd, hmax_rad);
     });
 }
 extern "C" void launch_kirch_forward(unsigned gx, unsigned gy, unsigned block,
-        const float* model, const void* tab_s, const void* tab_r, const int* hbin, float* data,
-        int ns, int nr, int nt, int npts, int tchunk, float idt, float ihd, float hmax_rad) {
+        const float* model, const void* tab_s, const void* tab_r, const int* hbin, const float* aaf,
+        void* data, int ns, int nr, int nt, int npts, int tchunk,
+        int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad) {
     if (block != FBLOCK) { fprintf(stderr, "fblock mismatch %u != %d\n", block, FBLOCK); abort(); }
     if (tchunk > TCHUNK_MAX) { fprintf(stderr, "tchunk too large\n"); abort(); }
     launch(gx, gy, FBLOCK, [&] {
-        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, data,
-                      ns, nr, nt, npts, tchunk, idt, ihd, hmax_rad);
+        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
+                      (dout_t*)data, ns, nr, nt, npts, tchunk, npad, pad, aa_max,
+                      idt, ihd, hmax_rad);
     });
 }

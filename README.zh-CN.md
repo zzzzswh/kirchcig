@@ -97,6 +97,35 @@ op = KirchhoffCIG(..., domain="angle", nh=30, hmax=60.0)   # 30 个道集，0-60
 
 此时 `hmax` 是最大半张角（度）。道集索引由炮点侧和检波点侧的出射角决定，出射角从走时梯度算出。
 
+### 抗假频滤波
+
+```python
+op = KirchhoffCIG(..., aa=True)                 # 默认 aa_factor=1.0, aa_max=32
+```
+
+克希霍夫求和在算子相邻两道之间的时差超过最高频率半个周期的地方就会假频，表现为大偏移距、浅层处陡倾、交叉的弧形伪影；道距粗时它们会淹没整个剖面。`aa=True` 让每一项贡献都经过一个半宽随当地算子倾角变化的三角滤波器再进入求和，这是 Lumley、Claerbout 与 Bevc（1994）的标准做法，Claerbout 的 `trimo` 和 Madagascar 的 `sfmig2` 用的都是它。
+
+![单炮脉冲响应：假频、抗假频、密采样参考](docs/img/antialias.png)
+
+<sub>一炮，每道一个带限脉冲。左：31 道 @ 100 m，直接求和。中：同一份数据，`aa=True`。右：301 道 @ 10 m，不滤波。`python examples/antialias.py`。</sub>
+
+- `aa_factor` 缩放滤波宽度，等价于 `trimo` 和 `sfmig2` 的 `antialias=` 参数（三者默认都是 1.0）。取 2.0 时三角谱的第一个零点正好落在假频频率上，代价是陡倾角处的分辨率。
+- `aa_max` 限制半宽的样点数上限（默认 32）。
+- 算子倾角由走时表沿道轴差分得到，因此 eikonal 走时和自带走时表都能用。炮点、检波点轴必须沿测线排序，否则构造时会给出警告。
+- 算子对仍然是精确转置，开着滤波 `dot_test()` 照样通过。
+- 代价：滤波通过道的双重累加上的一个三抽头恒等式施加，所以开销与滤波宽度无关。但需要一份 float64 的数据副本，`ns * nr * (nt + 2*aa_max + 1) * 8` 字节，且伴随每项贡献读 3 个 float64 抽头而不是 1 个 float32 样点。V100 上伴随 1.9 倍、正演 2.6 倍（见「性能」一节）；`python benchmarks/bench.py --aa` 可在你的卡上实测。
+
+### 偏移孔径
+
+```python
+op = KirchhoffCIG(..., aperture=60.0)           # 与垂直方向的锥角半角 [度]
+op = KirchhoffCIG(..., apt=3000.0)              # 或横向距离 [m]；两者可以同时给
+```
+
+一条道只对同时落在其炮点**和**检波点孔径内的成像点有贡献：在它们正下方 `aperture` 度的锥内（`sfkirmig` 的 `aperture=`），或横向距离不超过 `apt` 米（`sfmig2` 的 `apt=`，这里单位是米）。这既压远端摆动噪声，又跳过被丢弃贡献的计算，所以是加速而不是开销：README 那个几何下 60° 锥保留 47% 的道–成像点对，45° 保留 23%（`python benchmarks/bench.py --aperture 60` 会打印比例和计时）。和 Madagascar 一样是硬截断；`op.aperture_masks()` 返回两个布尔掩码。
+
+孔径在主机端施加：把被掩掉的走时表项推到道的末端之外，内核本来就会跳过那里。不改内核，两个引擎丢掉的贡献完全相同，算子对仍是精确转置。
+
 ### PyTorch
 
 ```python
@@ -134,6 +163,7 @@ op = KirchhoffCIG(..., trav=(trav_srcs, trav_recs))
 ```bash
 python examples/plot_cig.py          # 封面那张图
 python examples/vel_analysis.py      # 下面那张图
+python examples/antialias.py         # 上面的抗假频图
 python examples/lsqr_migration.py    # 用 SciPy LSQR 做最小二乘偏移
 python examples/torch_deep_prior.py  # 深度先验 LSM
 python benchmarks/bench.py           # 性能测试
@@ -151,12 +181,13 @@ python benchmarks/bench.py           # 性能测试
 |---|---|---|---|
 | `float64`（默认） | 52.9 ms — 30.5 G 配对/秒 | 25.5 ms — 63.2 G 配对/秒 | 9.5e-08 |
 | `float32` | 33.5 ms — 48.2 G 配对/秒 | 18.8 ms — 85.8 G 配对/秒 | 1.1e-07 |
+| `float64`，`aa=True` | 98.5 ms — 16.4 G 配对/秒 | 67.4 ms — 23.9 G 配对/秒 | 2.0e-08 |
 
-算子构建（含走时表与一次性 NVRTC 编译）约 1.4 s。`forward` 比 `adjoint` 快近一倍：它每个 block 处理一个道，在共享内存里累加完一次写出；而 `adjoint` 要沿走时曲线做不规则的散射读取。
+算子构建（含走时表与一次性 NVRTC 编译）约 1.4 s（`aa=True` 时 2.0 s，多出的是对走时表差分算算子倾角）。抗假频在伴随上是 1.9 倍开销（每项贡献读 3 个 float64 抽头而不是 1 个 float32 样点），正演 2.6 倍（6 次共享内存原子加代替 2 次，加上 float64 输出及其反向积分）。`forward` 比 `adjoint` 快近一倍：它每个 block 处理一个道，在共享内存里累加完一次写出；而 `adjoint` 要沿走时曲线做不规则的散射读取。
 
 float64 累加在 Volta 及其他数据中心卡上几乎不增加开销（FP64:FP32 为 1:2），换来的是与 NumPy 参考引擎逐位一致的结果。消费级 GeForce 卡上这个比例约为 1:64，在那类卡上应默认使用 `acc="float32"`,代价约为 1e-7 的相对精度。
 
-复现：`python benchmarks/bench.py`，可接受 `--acc float32`、`--nh`、`--domain`、`--engine numpy` 等参数。算子在单张卡上运行，可通过 `cupy.cuda.Device` 指定设备；使用 PyTorch 封装时则由张量所在设备决定。
+复现：`python benchmarks/bench.py`，可接受 `--acc float32`、`--nh`、`--domain`、`--aa`、`--aperture`、`--engine numpy` 等参数。前两行是不开抗假频的结果。算子在单张卡上运行，可通过 `cupy.cuda.Device` 指定设备；使用 PyTorch 封装时则由张量所在设备决定。
 
 ## 实现
 
@@ -169,13 +200,14 @@ float64 累加在 Volta 及其他数据中心卡上几乎不增加开销（FP64:
 - **累加器默认 float64。** 一个偏移样点要累加 10^4 到 10^5 项。用 float64 累加时，CUDA 引擎与 NumPy 参考引擎逐位一致；改用 float32 约引入 1e-7 相对误差，换来约 1.5 倍加速。
 - **模型布局 `(nh, nx, nz)`** 同时保证伴随的回写和正演的模型读取都是合并访问。
 - **编译期特化。** `nh`、block 大小、累加器类型、偏移距/角度域开关都通过 `-D` 注入，因此 `nh` 是真正的编译期常量。改动它会触发一次约一秒的 NVRTC 重编译。
+- **抗假频只花三个抽头，不循环。** 半宽 `n` 的三角滤波作用在道 `d` 上等于 `(D[i+n-1] - 2 D[i-1] + D[i-n-1]) / n^2`，`D` 是 `d` 的双重累加，所以任何宽度的滤波贡献都只是三次插值读取。伴随核函数读的是 CuPy 用两次 cumsum 准备好的 float64 `D`；正演核函数散射转置后的六个抽头，再由 CuPy 反向双重累加。`D` 按 `nt^2` 增长而二阶差分几乎全部抵消，所以它必须是 float64，正演的道累加器在 `aa=True` 下也不论 `acc` 一律 float64。算子倾角打包在走时表元素里紧挨走时，多出来的输入只是一次更宽的合并读取，而不是再读一张表。
 - **PyTorch 不做任何数值计算。** `kirchcig.torch` 只通过 DLPack 与 CuPy 交换显存（数据不离开 GPU，非默认 stream 也会被正确处理），并把这一对算子注册为 `autograd.Function`。卸掉 torch，CUDA 引擎不受任何影响。
 
 大规模问题通过时间轴分块和炮点轴分片处理，两者都是精确的,测试套件会验证分片结果与不分片完全一致。
 
 ## 已知限制
 
-- **尚无抗假频滤波。** 算子假频会在大偏移距处表现为陡倾角伪影。计划在 v0.2 加入（三角滤波器组，Lumley-Claerbout）。
+- **尚无半阶导数（rho）滤波和幅度权。** 算子是单位权直接求和；后续计划见 `IMPLEMENTATION_NOTES.md`。
 - **仅支持 2D。** 瓶颈在走时表，不在核函数。
 - **偏移距分道集用的是半偏移距绝对值**，因此不区分正负偏移距。
 

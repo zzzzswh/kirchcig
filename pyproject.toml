@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kirchcig"
-version = "0.1.0"
+version = "0.2.0"
 description = "GPU Kirchhoff migration to common-image gathers, and its exact adjoint."
 readme = "README.md"
 license = { text = "MIT" }
@@ -32,7 +32,7 @@ torch = ["torch"]
 test = ["pytest", "scipy", "scikit-fmm"]
 
 [project.urls]
-Homepage = "https://github.com/kirchcig/kirchcig"
+Homepage = "https://github.com/zzzzswh/kirchcig"
 
 [tool.setuptools.packages.find]
 include = ["kirchcig*"]

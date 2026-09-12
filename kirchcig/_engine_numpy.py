@@ -52,15 +52,22 @@ def aa_width(dip_s, dip_r, aaf, nmax):
     """Triangle half-width in samples, mirroring ``kc_aa_width`` in the CUDA
     source.
 
-    ``n = clip(round((dip_s + dip_r) * aaf + 1), 1, nmax)`` in float32, where
+    ``n = clip(round((dip_s + dip_r) * aaf + 1), 1, nmax)``, where
     ``aaf = aa_factor * drho / dt`` carries the effective trace spacing of the
     (source, receiver) pair. Source and receiver dips are *summed*, following
     Lumley, Claerbout and Bevc (1994) eq. 4 and the ``tx`` expression in
     Madagascar's ``sfmig2``; the trailing ``+1`` is their ``+dt``, which keeps
     the triangle at least one sample wide. ``n == 1`` is the identity.
+
+    Operation order matters for the bit-for-bit match with the kernel: the sum
+    and the product are float32, then 1.5 is added in float64 (exact) and the
+    result truncated. Rounding the product to float32 before the add is what
+    the kernel does as well; a float32 ``x + 1.5f`` would be a candidate for
+    FMA contraction on the GPU and could land on a different integer.
     """
     d = np.asarray(dip_s, dtype=_F32) + np.asarray(dip_r, dtype=_F32)
-    n = (d * np.asarray(aaf, dtype=_F32) + _F32(1.0) + _F32(0.5)).astype(np.int32)
+    x = d * np.asarray(aaf, dtype=_F32)
+    n = (x.astype(np.float64) + 1.5).astype(np.int32)
     return np.clip(n, 1, nmax).astype(np.int32)
 
 

@@ -65,6 +65,31 @@ def _sanitize_tables(trav, t_big):
     return trav
 
 
+def aperture_mask(pos, x, z, aperture=None, apt=None):
+    """``(n, nx, nz)`` bool: image points inside the migration aperture of each
+    of the ``n`` positions in ``pos`` (rows ``(x, z)``).
+
+    ``aperture`` is the largest angle from the vertical, in degrees, of the
+    straight line from the position down to the image point (a cone opening
+    downwards, ``sfkirmig``'s ``aperture=``); ``apt`` is the largest lateral
+    distance in metres (``sfmig2``'s ``apt=``, in metres rather than traces).
+    Either may be ``None``. Points at or above the position are outside any
+    cone narrower than 90 degrees.
+    """
+    pos = np.asarray(pos, dtype=np.float64)
+    dxs = x[None, :, None] - pos[0][:, None, None]        # (n, nx, 1)
+    dzs = z[None, None, :] - pos[1][:, None, None]        # (n, 1, nz)
+    mask = np.ones((pos.shape[1], x.size, z.size), dtype=bool)
+    if aperture is not None:
+        # tan(45 deg) is 1 - 1e-16 in floating point; the tiny slack keeps
+        # points exactly on the cone edge inside, as the definition says.
+        tap = math.tan(math.radians(aperture)) + 1e-9
+        mask &= (dzs >= 0) & (np.abs(dxs) <= tap * dzs)
+    if apt is not None:
+        mask &= np.abs(dxs) <= apt
+    return mask
+
+
 def ricker(t, f0):
     a = (np.pi * f0 * t) ** 2
     return (1.0 - 2.0 * a) * np.exp(-a)
@@ -105,7 +130,11 @@ class KirchhoffCIG:
     aa : anti-alias filtering. Each contribution is read through a triangle
         filter whose half-width follows the local operator dip, which
         suppresses the steeply dipping artefacts the summation would otherwise
-        alias in. Costs roughly 3x the data-side memory traffic.
+        alias in. Both engines support it. The filter works on the float64
+        double integral of the traces, so it needs a float64 copy of the data
+        (``ns * nr * (nt + 2*aa_max + 1) * 8`` bytes) and reads three taps per
+        contribution instead of one; expect the adjoint to be a few times
+        slower than without it.
     aa_factor : dimensionless multiplier on the operator dip, matching the
         ``antialias`` parameter of Claerbout's ``trimo`` and Madagascar's
         ``sfmig2``, both of which default to 1.0. At 2.0 the triangle's first
@@ -113,12 +142,27 @@ class KirchhoffCIG:
         criterion of Lumley, Claerbout and Bevc (1994) eq. 12 and what
         Claerbout used for migration; it costs resolution on steep dips.
     aa_max : largest triangle half-width in samples (default 32)
+    aperture : migration aperture as the largest angle from the vertical, in
+        degrees, between an image point and the source *and* the receiver of
+        a trace (``sfkirmig``'s ``aperture=``). Contributions outside the cone
+        are dropped, which suppresses far-aperture swing noise and skips their
+        work. ``None`` (default) or 90 means no limit.
+    apt : lateral aperture, the largest ``|x - x_src|`` and ``|x - x_rec|`` in
+        metres (``sfmig2``'s ``apt=``, in metres). ``None`` means no limit.
+        Both limits may be combined; a contribution needs to pass both.
+
+    Both apertures are applied by pushing the masked traveltime-table entries
+    beyond the trace end, where the kernels already skip them, so the two
+    engines drop exactly the same contributions and the pair stays an exact
+    transpose. ``trav_srcs`` / ``trav_recs`` stay unmasked; see
+    :meth:`aperture_masks`.
     """
 
     def __init__(self, nx, nz, dx, dz, srcs, recs, nt, dt, vel=None, nh=1, hmax=None,
                  domain="offset", engine="auto", trav=None, ox=0.0, oz=0.0,
                  acc="float64", block=None, split="auto", eikonal=None,
-                 aa=False, aa_factor=1.0, aa_max=32, _tables=None):
+                 aa=False, aa_factor=1.0, aa_max=32, aperture=None, apt=None,
+                 _tables=None):
         self.nx, self.nz = int(nx), int(nz)
         self.dx, self.dz = float(dx), float(dz)
         self.ox, self.oz = float(ox), float(oz)
@@ -134,6 +178,16 @@ class KirchhoffCIG:
         self.aa_max = int(aa_max)
         if self.aa and (self.aa_factor <= 0 or self.aa_max < 1):
             raise ValueError("need aa_factor > 0 and aa_max >= 1")
+        if aperture is not None:
+            aperture = float(aperture)
+            if aperture <= 0:
+                raise ValueError("aperture must be in (0, 90] degrees")
+            if aperture >= 90.0:
+                aperture = None                      # a 90-degree cone is no limit
+        if apt is not None and float(apt) <= 0:
+            raise ValueError("apt must be positive")
+        self.aperture = aperture
+        self.apt = None if apt is None else float(apt)
         self.vel = None if vel is None else (float(vel) if np.ndim(vel) == 0 else np.asarray(vel))
         if self.nh < 1:
             raise ValueError("nh must be >= 1")
@@ -216,19 +270,26 @@ class KirchhoffCIG:
             self._ihd = self.nh / self._hmax_rad
         self._hbin = np.ascontiguousarray(hb)
 
+        # -- aperture: mask by pushing table entries past the trace end ---------
+        tabs_t, tabr_t = self._trav_s, self._trav_r
+        if self.aperture is not None or self.apt is not None:
+            ms, mr = self.aperture_masks()
+            tabs_t = np.where(ms, tabs_t, np.float32(t_big))
+            tabr_t = np.where(mr, tabr_t, np.float32(t_big))
+
         # -- engine --------------------------------------------------------------
         self.engine = _resolve_engine(engine)
         npts = self.nx * self.nz
         kw = dict(
-            tabs_t=self._trav_s.reshape(self.ns, npts),
-            tabr_t=self._trav_r.reshape(self.nr, npts),
+            tabs_t=tabs_t.reshape(self.ns, npts),
+            tabr_t=tabr_t.reshape(self.nr, npts),
             hbin=self._hbin, nh=self.nh, nt=self.nt, idt=1.0 / self.dt,
             angle=(domain == "angle"),
             tabs_a=None if self._ang_s is None else self._ang_s.reshape(self.ns, npts),
             tabr_a=None if self._ang_r is None else self._ang_r.reshape(self.nr, npts),
             ihd=self._ihd, hmax_rad=self._hmax_rad,
         )
-        if self.aa:                      # only the numpy engine accepts these so far
+        if self.aa:
             kw.update(
                 aa=True,
                 tabs_d=self._dip_s.reshape(self.ns, npts),
@@ -236,11 +297,6 @@ class KirchhoffCIG:
                 aaf=self._aa_scale(), aa_max=self.aa_max,
             )
         if self.engine == "cuda":
-            if self.aa:
-                raise NotImplementedError(
-                    "anti-alias filtering is implemented in the numpy reference "
-                    "engine only so far; pass engine='numpy', or aa=False to "
-                    "migrate without it on the GPU")
             from ._engine_cuda import CudaEngine
             self._eng = CudaEngine(acc=acc, block=block, split=split, **kw)
         else:
@@ -303,6 +359,14 @@ class KirchhoffCIG:
         from ._engine_numpy import aa_width
         return aa_width(self._dip_s[:, None], self._dip_r[None, :],
                         self._aa_scale()[:, :, None, None], self.aa_max)
+
+    def aperture_masks(self):
+        """``(ns, nx, nz)`` and ``(nr, nx, nz)`` bool arrays of the image points
+        inside the aperture of every source and receiver (all True without an
+        aperture). A trace contributes to an image point when both are True."""
+        x, z = image_axes(self.nx, self.nz, self.dx, self.dz, self.ox, self.oz)
+        return (aperture_mask(self.srcs, x, z, self.aperture, self.apt),
+                aperture_mask(self.recs, x, z, self.aperture, self.apt))
 
     @property
     def trav_srcs(self):
@@ -441,6 +505,7 @@ class KirchhoffCIG:
                   recs=self.recs, nt=self.nt, dt=self.dt, vel=self.vel, nh=self.nh,
                   hmax=self.hmax, domain=self.domain, ox=self.ox, oz=self.oz, acc=self.acc,
                   aa=self.aa, aa_factor=self.aa_factor, aa_max=self.aa_max,
+                  aperture=self.aperture, apt=self.apt,
                   engine=self.engine if engine is None else engine,
                   _tables=dict(trav_s=self._trav_s, trav_r=self._trav_r,
                                ang_s=self._ang_s, ang_r=self._ang_r,
@@ -454,7 +519,7 @@ class KirchhoffCIG:
     def __repr__(self):
         return (f"KirchhoffCIG(shape_model={self.shape_model}, shape_data={self.shape_data}, "
                 f"domain={self.domain!r}, hmax={self.hmax:g}, aa={self.aa}, "
-                f"engine={self.engine!r})")
+                f"aperture={self.aperture}, apt={self.apt}, engine={self.engine!r})")
 
 
 # --------------------------------------------------------------------- migrate
@@ -470,6 +535,8 @@ def migrate(data, vel, srcs, recs, dt, dx, dz, nh=1, hmax=None, domain="offset",
     srcs, recs : (2, ns), (2, nr) positions, rows (x, z) [m]
     dt, dx, dz : sampling [s], [m], [m]
     nh, hmax, domain, engine, trav, ox, oz : see :class:`KirchhoffCIG`
+    aa : anti-alias filtering (``aa_factor`` and ``aa_max`` pass through)
+    aperture, apt : migration aperture in degrees / metres (pass through)
 
     Returns
     -------

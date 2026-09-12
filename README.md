@@ -97,6 +97,35 @@ op = KirchhoffCIG(..., domain="angle", nh=30, hmax=60.0)   # 30 bins, 0-60 deg
 
 `hmax` is the maximum half opening angle in degrees. Bin indices come from source- and receiver-side emergence angles, computed from the traveltime gradients.
 
+### Anti-alias filtering
+
+```python
+op = KirchhoffCIG(..., aa=True)                 # default aa_factor=1.0, aa_max=32
+```
+
+Kirchhoff summation aliases wherever the operator's moveout between neighbouring traces exceeds half a period of the highest frequency present. It shows up as steeply dipping, criss-crossing arcs at large offsets and shallow depths; on coarsely sampled data they dominate the image. `aa=True` reads every contribution through a triangle filter whose half-width follows the local operator dip, the standard remedy of Lumley, Claerbout and Bevc (1994) as used by Claerbout's `trimo` and Madagascar's `sfmig2`.
+
+![Single-shot impulse response: aliased, anti-aliased, and a densely sampled reference](docs/img/antialias.png)
+
+<sub>One shot, a band-limited spike in every trace. Left: 31 receivers at 100 m, plain summation. Middle: the same data with `aa=True`. Right: 301 receivers at 10 m, no filter. `python examples/antialias.py`.</sub>
+
+- `aa_factor` scales the filter width and is the `antialias=` parameter of `trimo` and `sfmig2` (all default to 1.0). 2.0 puts the triangle's first spectral null exactly on the alias frequency, at the cost of resolution on steep dips.
+- `aa_max` caps the half-width in samples (default 32).
+- Operator dips come from differencing the traveltime tables along the trace axis, so it works for eikonal and user-supplied tables alike. The source and receiver axes must be sorted along the line; the constructor warns otherwise.
+- The operator pair stays an exact transpose; `dot_test()` passes with the filter on.
+- Cost: the filter is applied through a three-tap identity on the double integral of the traces, so the price does not depend on the filter width. It does need a float64 copy of the data, `ns * nr * (nt + 2*aa_max + 1) * 8` bytes, and the adjoint reads three float64 taps per contribution instead of one float32 sample. On a V100 that is 1.9x on the adjoint and 2.6x on the forward (see Performance); `python benchmarks/bench.py --aa` measures it on yours.
+
+### Migration aperture
+
+```python
+op = KirchhoffCIG(..., aperture=60.0)           # cone half-angle from the vertical [deg]
+op = KirchhoffCIG(..., apt=3000.0)              # or a lateral distance [m]; both may be combined
+```
+
+A trace contributes to an image point only if the point lies inside the aperture of *both* its source and its receiver: within `aperture` degrees of the vertical below them (`sfkirmig`'s `aperture=`), or within `apt` metres laterally (`sfmig2`'s `apt=`, in metres here). This suppresses far-aperture swing noise and skips the dropped contributions' work, so it is a speed-up, not a cost: on the README geometry a 60-degree cone keeps 47% of the trace-image-point pairs, 45 degrees keeps 23% (`python benchmarks/bench.py --aperture 60` prints the fraction and the timing). The cut is hard, as in Madagascar; `op.aperture_masks()` returns the two boolean masks.
+
+The aperture is applied on the host by pushing the masked traveltime-table entries past the end of the trace, where the kernels already skip. No kernel changes, both engines drop exactly the same contributions, and the pair stays an exact transpose.
+
 ### PyTorch
 
 ```python
@@ -134,6 +163,7 @@ Otherwise traveltimes come from an eikonal solve (`scikit-fmm`), or analytically
 ```bash
 python examples/plot_cig.py          # the cover figure
 python examples/vel_analysis.py      # the figure below
+python examples/antialias.py         # the anti-aliasing figure above
 python examples/lsqr_migration.py    # least-squares migration with SciPy LSQR
 python examples/torch_deep_prior.py  # deep-prior LSM
 python benchmarks/bench.py           # timings
@@ -151,12 +181,13 @@ Single **Tesla V100-PCIE-32GB** (driver 580.178.04), `nx=401, nz=201, ns=100, nr
 |---|---|---|---|
 | `float64` (default) | 52.9 ms — 30.5 G pair-evals/s | 25.5 ms — 63.2 G pair-evals/s | 9.5e-08 |
 | `float32` | 33.5 ms — 48.2 G pair-evals/s | 18.8 ms — 85.8 G pair-evals/s | 1.1e-07 |
+| `float64`, `aa=True` | 98.5 ms — 16.4 G pair-evals/s | 67.4 ms — 23.9 G pair-evals/s | 2.0e-08 |
 
-Building the operator, including traveltime tables and the one-off NVRTC compile, takes about 1.4 s. `forward` is roughly twice as fast as `adjoint`: it accumulates one trace per block in shared memory and writes it out once, while `adjoint` does an irregular gather along the traveltime curves.
+Building the operator, including traveltime tables and the one-off NVRTC compile, takes about 1.4 s (2.0 s with `aa=True`, which also differences the tables for the operator dips). Anti-aliasing costs 1.9x on the adjoint (three float64 taps per contribution instead of one float32 sample) and 2.6x on the forward (six shared-memory atomics instead of two, plus the float64 output and its reverse integration). `forward` is roughly twice as fast as `adjoint`: it accumulates one trace per block in shared memory and writes it out once, while `adjoint` does an irregular gather along the traveltime curves.
 
 float64 accumulation is close to free on Volta and other data-centre cards (1:2 FP64:FP32) and buys bit-identical agreement with the NumPy reference engine. On consumer GeForce parts the ratio is about 1:64, so `acc="float32"` is the sensible default there; it costs roughly 1e-7 of relative accuracy.
 
-Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain` and `--engine numpy` are accepted. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
+Reproduce with `python benchmarks/bench.py`; `--acc float32`, `--nh`, `--domain`, `--aa`, `--aperture` and `--engine numpy` are accepted. The first two rows are without anti-aliasing. The operator runs on one device; select it with `cupy.cuda.Device`, or from the PyTorch wrapper by the tensor's device.
 
 ## How it works
 
@@ -169,13 +200,14 @@ The kernels live as a CUDA C++ string in `kirchcig/_kernels.py`, compiled by `cu
 - **float64 accumulators by default.** A migrated sample sums 10^4 to 10^5 terms. With float64 accumulation the CUDA engine is bit-identical to the NumPy reference; float32 accumulation costs about 1e-7 relative error for roughly 1.5x speed.
 - **Model layout `(nh, nx, nz)`** keeps both the adjoint writeback and the forward model reads coalesced.
 - **Compile-time specialisation.** `nh`, block size, accumulator type and the offset/angle switch are `-D` flags, so `nh` is a true compile-time constant. Changing it costs about a second of NVRTC, once.
+- **Anti-aliasing costs three taps, not a filter loop.** A triangle of half-width `n` applied to a trace `d` equals `(D[i+n-1] - 2 D[i-1] + D[i-n-1]) / n^2` with `D` the double cumulative sum of `d`, so a contribution filtered by any width is still three interpolated reads. The adjoint kernel reads a float64 `D` that CuPy prepares with two cumulative sums; the forward kernel scatters the six transposed taps and CuPy reverse-integrates the result. `D` grows like `nt^2` and the second difference cancels almost all of it, which is why it is float64 and why the forward's trace accumulator is float64 under `aa=True` regardless of `acc`. The operator dip is packed next to the traveltime in the table element, so the extra input is one wider coalesced load, not a second table read.
 - **PyTorch does no numerical work.** `kirchcig.torch` exchanges GPU buffers with CuPy through DLPack (nothing leaves the device; non-default streams are honoured) and registers the pair as `autograd.Function`s. Remove torch and the CUDA engine is unaffected.
 
 Large problems are handled by chunking the time axis and splitting the source axis; both are exact, and the test suite checks that a split result equals an unsplit one.
 
 ## Limitations
 
-- **No anti-alias filtering yet.** Operator aliasing shows up as steeply dipping artefacts at large offsets. Planned for v0.2 (triangle filter bank, Lumley-Claerbout).
+- **No half-derivative (rho) filter or amplitude weights yet.** The operator is a plain unit-weight summation; see the roadmap in `IMPLEMENTATION_NOTES.md`.
 - **2D only.** The traveltime tables are the obstacle, not the kernels.
 - **Offset binning uses absolute half-offset**, so positive and negative offsets are not distinguished.
 

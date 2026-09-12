@@ -148,6 +148,78 @@ def test_gradient_velocity_operator_dot_test():
     assert abs(ang[0, int(srcs[0, 0] / 10.0), 20]) < np.radians(3.0)
 
 
+# ----------------------------------------------------------------- aperture
+def test_aperture_mask_geometry():
+    from kirchcig import aperture_mask
+    x, z = np.arange(11) * 10.0, np.arange(6) * 10.0
+    pos = np.array([[50.0, 20.0], [0.0, 10.0]])            # second one buried
+    m = aperture_mask(pos, x, z, aperture=45.0)
+    # 45 degrees: |dx| <= dz, points at or above the position excluded
+    for i in range(2):
+        dx = np.abs(x[:, None] - pos[0, i]); dz = z[None, :] - pos[1, i]
+        assert np.array_equal(m[i], (dz >= 0) & (dx <= dz))
+    assert m[1][:, 0].sum() == 0                           # everything above a buried source is out
+    m2 = aperture_mask(pos, x, z, apt=25.0)
+    assert np.array_equal(m2[0], (np.abs(x[:, None] - 50.0) <= 25.0) & np.ones((1, 6), bool))
+    m3 = aperture_mask(pos, x, z, aperture=45.0, apt=25.0)
+    assert np.array_equal(m3, m & m2)
+    assert aperture_mask(pos, x, z).all()
+
+
+def test_aperture_drops_exactly_the_masked_contributions():
+    """A spike at one image point demigrates onto every trace whose source and
+    receiver both see the point inside their cone, and onto no other."""
+    plain = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=1)
+    ap = plain._clone(aperture=30.0)
+    ix, iz = 20, 20
+    spike = np.zeros(plain.shape_model, np.float32); spike[0, ix, iz] = 1.0
+    d0, d1 = plain.forward(spike), ap.forward(spike)
+    ms, mr = ap.aperture_masks()
+    keep = ms[:, ix, iz][:, None] & mr[:, ix, iz][None, :]  # (ns, nr)
+    assert keep.any() and not keep.all()
+    assert np.array_equal(d1[keep], d0[keep])
+    assert (d1[~keep] == 0).all()
+    # adjoint: same pairs dropped, so the pair stays an exact transpose
+    assert ap.dot_test()
+    # tables themselves are left untouched
+    assert np.array_equal(ap.trav_srcs, plain.trav_srcs)
+
+
+def test_aperture_ninety_and_none_are_no_limit():
+    plain = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=4, hmax=400.0)
+    d = plain.demo_data()
+    for kw in (dict(aperture=90.0), dict(aperture=120.0), dict(aperture=None, apt=None)):
+        op = plain._clone(**kw)
+        assert op.aperture is None
+        assert np.array_equal(op.adjoint(d), plain.adjoint(d))
+    with pytest.raises(ValueError):
+        plain._clone(aperture=0.0)
+    with pytest.raises(ValueError):
+        plain._clone(apt=-1.0)
+
+
+def test_apt_lateral_aperture():
+    plain = KirchhoffCIG.demo(engine="numpy", **SMALL, nh=1)
+    ap = plain._clone(apt=100.0)
+    ms, mr = ap.aperture_masks()
+    lateral = np.abs(plain.x[None, :, None] - plain.srcs[0][:, None, None]) <= 100.0
+    assert np.array_equal(ms, np.broadcast_to(lateral, ms.shape))
+    assert ap.dot_test()
+    # fewer contributions than without it
+    ones = np.ones(plain.shape_data, np.float32)
+    assert (ap.adjoint(ones) <= plain.adjoint(ones) + 1e-6).all()
+    assert ap.adjoint(ones).sum() < 0.5 * plain.adjoint(ones).sum()
+
+
+def test_aperture_with_antialias_uses_unmasked_dips():
+    """Dips are differenced from the clean tables, so the mask edge must not
+    create huge filter widths."""
+    op = KirchhoffCIG.demo(engine="numpy", aa=True, aperture=40.0)
+    ref = KirchhoffCIG.demo(engine="numpy", aa=True)
+    assert op.aa_widths().max() == ref.aa_widths().max()
+    assert op.dot_test()
+
+
 # ---------------------------------------------------------------------- cuda
 needs_cuda = pytest.mark.skipif(not cuda_available(), reason="needs CuPy and a GPU")
 
@@ -203,6 +275,78 @@ def test_cuda_cupy_in_cupy_out():
 def test_cuda_float32_accumulation():
     op = KirchhoffCIG.demo(engine="cuda", **SMALL, nh=8, hmax=400.0, acc="float32")
     assert op.dot_test()          # default tolerance is 1e-3 for float32
+
+
+@needs_cuda
+@pytest.mark.parametrize("kw", [{}, dict(nh=1), dict(domain="angle", nh=12, hmax=50.0)])
+def test_cuda_aa_dot_test(kw):
+    op = KirchhoffCIG.demo(engine="cuda", aa=True, aa_max=64, **kw)
+    assert op.aa_widths().max() > 1, "geometry must actually trigger filtering"
+    ok, err = op.dot_test(return_error=True)
+    assert ok, err
+
+
+@needs_cuda
+@pytest.mark.parametrize("kw", [{}, dict(domain="angle", nh=12, hmax=50.0)])
+def test_cuda_aa_matches_numpy(kw):
+    """Same taps, same width expression: the two engines agree to float32
+    rounding of the result (float64 cumulative sums are not bit-identical
+    between a sequential and a parallel scan, but that is at 1e-16 of D)."""
+    op_c = KirchhoffCIG.demo(engine="cuda", aa=True, aa_max=64, **kw)
+    op_n = op_c._clone(engine="numpy")
+    d = op_c.demo_data()
+    assert _rel(op_c.adjoint(d), op_n.adjoint(d)) < 1e-5
+    x = np.random.default_rng(0).standard_normal(op_c.shape_model, dtype=np.float32)
+    assert _rel(op_c.forward(x), op_n.forward(x)) < 1e-5
+
+
+@needs_cuda
+def test_cuda_aa_time_chunking_and_source_split_are_exact():
+    """The six forward taps of one contribution can straddle a window edge and
+    the adjoint's float64 D buffer is shared by all splits."""
+    op = KirchhoffCIG.demo(engine="cuda", aa=True, aa_max=64)
+    d = op.demo_data()
+    x = np.random.default_rng(0).standard_normal(op.shape_model, dtype=np.float32)
+    ref_f, ref_a = op.forward(x), op.adjoint(d)
+    op._eng.set_time_chunk(50)                        # much smaller than 2*aa_max
+    assert op._eng.nchunk > 5
+    assert _rel(op.forward(x), ref_f) < 1e-6
+    op._eng.split = 3
+    assert _rel(op.adjoint(d), ref_a) < 1e-6
+
+
+@needs_cuda
+def test_cuda_aa_float32_accumulation():
+    """The forward's trace accumulator stays float64 under anti-aliasing (it is
+    integrated twice afterwards), so acc='float32' costs no more accuracy with
+    the filter than without it."""
+    op = KirchhoffCIG.demo(engine="cuda", aa=True, acc="float32")
+    ok, err = op.dot_test(return_error=True)
+    assert ok and err < 1e-5, err
+    x = np.random.default_rng(0).standard_normal(op.shape_model, dtype=np.float32)
+    assert _rel(op.forward(x), op._clone(engine="numpy").forward(x)) < 1e-6
+
+
+@needs_cuda
+@pytest.mark.parametrize("kw", [dict(aperture=45.0), dict(apt=300.0, aa=True),
+                                dict(aperture=50.0, domain="angle", nh=12, hmax=50.0)])
+def test_cuda_aperture_matches_numpy(kw):
+    op_c = KirchhoffCIG.demo(engine="cuda", **SMALL, **kw)
+    op_n = op_c._clone(engine="numpy")
+    d = op_c.demo_data()
+    assert _rel(op_c.adjoint(d), op_n.adjoint(d)) < 1e-5
+    x = np.random.default_rng(0).standard_normal(op_c.shape_model, dtype=np.float32)
+    assert _rel(op_c.forward(x), op_n.forward(x)) < 1e-5
+    assert op_c.dot_test()
+
+
+@needs_cuda
+def test_cuda_aa_output_is_plain_float32_trace():
+    op = KirchhoffCIG.demo(engine="cuda", aa=True, **SMALL)
+    x = np.random.default_rng(0).standard_normal(op.shape_model, dtype=np.float32)
+    d = op.forward(x)
+    assert d.shape == op.shape_data and d.dtype == np.float32
+    assert np.asarray(d).flags.c_contiguous
 
 
 # --------------------------------------------------------------------- torch
