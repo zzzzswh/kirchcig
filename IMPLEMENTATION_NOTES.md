@@ -166,15 +166,24 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
     远小于 `2·aa_max`）与 source 分片与不分块结果 <1e-6。真实 GPU 上 `cp.cumsum` 是并行 scan，
     与串行求和差在 1e-16·D 量级，对结果的影响同样在 1e-9 以下。
   - **V100 实测**（README 规模，nh=32，float64）：全部 cuda 测试通过（NVRTC 接受 `alignas(16)`
-    结构体和 `__fmul_rn`/`__fadd_rn`）；同一 session 内：`aa_stretch=False` adjoint 77.3 / forward 67.3 ms，
-    `aa_stretch=True` 128.8 / 72.0 ms（另一天 `aa_stretch=False` 测得 98.5 ms——session 间差 25%，
-    比较只看同一次测的）。梯度表那 8 B/pair 让伴随慢 1.7 倍，说明伴随受表读取而非算术限制。据此做了
+    结构体和 `__fmul_rn`/`__fadd_rn`）。打包与分组之前，同一 session 内：`aa_stretch=False` adjoint 77.3 /
+    forward 67.3 ms，`aa_stretch=True` 128.8 / 72.0 ms（另一天 `aa_stretch=False` 测得 98.5 ms——session
+    间差 25%，比较只看同一次测的）。梯度表那 8 B/pair 让伴随慢 1.7 倍，说明伴随受表读取而非算术限制。据此做了
     两件事（第 4 节表）：`gx, gz` 打包进 `tab_t`（offset+aa 正好 16 B，带角度或权重 32 B）；伴随按
     `SCH=4` 个炮点分组复用检波点表元素。仿真下 SCH=1/3/4/8 与 numpy 逐位一致，含不整除 `ns` 的尾部和
-    source 分片。真机数字待测（`bench.py --aa`、`--aa --no_aa_stretch`、`--schunk 1/2/4/8`）。正演的
-    2.6 倍比伴随的 1.9 倍重，来源是 6 次共享内存 double 原子加、`(ns,nr,npad)` float64 写出以及
+    source 分片。
+  - **打包+分组之后**（同一 session，全部 `schunk=4`）：基线 adjoint 33.9 / forward 25.6 ms（原 52.9 / 25.5）；
+    `aa_stretch=False` 72.7 / 67.3（原 77.3 / 67.3）；`aa_stretch=True` 62.0 / 71.2（原 128.8 / 72.0）；
+    angle+aa（8 float / 32 B 元素）91.1 / 113.7。`--schunk 1/4/8` 在 `aa_stretch=True` 上是
+    118.1 / 62.0 / 59.5 ms，正演恒为 71.1——收益绝大部分来自分组（1→4 是 1.9 倍），打包本身只占
+    128.8→118.1 那一段（跨 session），4→8 只剩 4%，默认留在 4。两个没解释清的点：(a) 打包+分组之后
+    `aa_stretch=True` 反而比 `aa_stretch=False` 快（62.0 vs 72.7），而它的元素宽一倍、滤波也更宽，
+    说明伴随已经不在表带宽上了，瓶颈换成了什么还不知道；(b) `aa_stretch=False` 没扫 `schunk`，
+    它自己从 77.3 降下来多少是未知的。待补：`--aa --no_aa_stretch --schunk 1/8` 定位 (a)(b)，
+    以及 `--acc float32`、`--aperture 60`——README 里这两处数字还是分组之前的。正演的
+    2.8 倍比伴随的 1.8 倍重，来源是 6 次共享内存 double 原子加、`(ns,nr,npad)` float64 写出以及
     主机侧两次反向 `cumsum`；如果以后要压这部分，可以考虑在内核里用 block 内 scan 直接做反向双重
-    积分，省掉 float64 中间缓冲。
+    积分，省掉 float64 中间缓冲。它现在是 `aa=True` 下更慢的那一侧。
 - **验证**：单炮脉冲响应，31 道 @100 m 对 301 道 @10 m 参考。横向粗糙度
   1.358（关闭）→ 0.563（antialias=1.0），参考值 0.554；峰值 0.0645 → 0.0528，参考 0.0568。
 

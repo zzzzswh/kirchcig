@@ -7,7 +7,11 @@
   gz`, padded to 1/2/4/8 floats), and the adjoint kernel processes sources in
   register chunks of `schunk` (default 4), loading each receiver-table element
   once per chunk instead of once per source. `schunk=` constructor knob,
-  `bench.py --schunk`.
+  `bench.py --schunk`. On a V100, README-sized problem: the `aa=True` adjoint
+  goes from 128.8 to 62.0 ms (`--schunk 1/4/8`: 118.1 / 62.0 / 59.5 ms) and the
+  plain `float64` adjoint from 52.9 to 33.9 ms; the forward is untouched. The
+  before/after pairs were measured in different sessions, which differ by up to
+  25% on that machine; the `--schunk` sweep is one session.
 
 ## 0.2.0
 
