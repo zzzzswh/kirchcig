@@ -5,6 +5,8 @@ build/
 dist/
 .pytest_cache/
 .venv/
-.venv/
-*.png
 .python-version
+
+# generated figures, except the curated ones used by the README
+*.png
+!docs/img/*.png
