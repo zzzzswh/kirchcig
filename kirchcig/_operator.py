@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 
 from ._engine_numpy import NumpyEngine
 from ._traveltime import (analytic_angle, emergence_angles, image_axes,
+                          trace_dips, trace_spacing,
                           traveltime_tables)
 
 _DOMAINS = ("offset", "angle")
@@ -29,6 +31,19 @@ def _positions(p, name):
         else:
             raise ValueError(f"{name} must be a (2, n) array of (x, z) positions, got {p.shape}")
     return np.ascontiguousarray(p)
+
+
+def _check_ordered(p, name):
+    """Anti-alias dips are differences between neighbouring table entries, so
+    the trace axis has to run along the line. Warn rather than raise: an
+    unordered axis still migrates correctly, it just over-filters."""
+    x = p[0]
+    if x.size > 2 and not (np.all(np.diff(x) >= 0) or np.all(np.diff(x) <= 0)):
+        warnings.warn(
+            f"{name} are not sorted along x; anti-alias filtering assumes "
+            f"neighbouring indices are neighbouring positions and will "
+            f"over-filter. Sort {name} (and the matching data axis) first.",
+            stacklevel=3)
 
 
 def _resolve_engine(engine):
@@ -87,11 +102,23 @@ class KirchhoffCIG:
     acc : accumulator precision of the cuda engine, "float64" or "float32"
     block, split : cuda engine tuning knobs (see ``_engine_cuda``)
     eikonal : dict of keyword arguments for the eikonal solver
+    aa : anti-alias filtering. Each contribution is read through a triangle
+        filter whose half-width follows the local operator dip, which
+        suppresses the steeply dipping artefacts the summation would otherwise
+        alias in. Costs roughly 3x the data-side memory traffic.
+    aa_factor : dimensionless multiplier on the operator dip, matching the
+        ``antialias`` parameter of Claerbout's ``trimo`` and Madagascar's
+        ``sfmig2``, both of which default to 1.0. At 2.0 the triangle's first
+        spectral null sits exactly at the alias frequency, which is the
+        criterion of Lumley, Claerbout and Bevc (1994) eq. 12 and what
+        Claerbout used for migration; it costs resolution on steep dips.
+    aa_max : largest triangle half-width in samples (default 32)
     """
 
     def __init__(self, nx, nz, dx, dz, srcs, recs, nt, dt, vel=None, nh=1, hmax=None,
                  domain="offset", engine="auto", trav=None, ox=0.0, oz=0.0,
-                 acc="float64", block=None, split="auto", eikonal=None, _tables=None):
+                 acc="float64", block=None, split="auto", eikonal=None,
+                 aa=False, aa_factor=1.0, aa_max=32, _tables=None):
         self.nx, self.nz = int(nx), int(nz)
         self.dx, self.dz = float(dx), float(dz)
         self.ox, self.oz = float(ox), float(oz)
@@ -102,6 +129,11 @@ class KirchhoffCIG:
         self.nh = int(nh)
         self.domain = domain
         self.acc = acc
+        self.aa = bool(aa)
+        self.aa_factor = float(aa_factor)
+        self.aa_max = int(aa_max)
+        if self.aa and (self.aa_factor <= 0 or self.aa_max < 1):
+            raise ValueError("need aa_factor > 0 and aa_max >= 1")
         self.vel = None if vel is None else (float(vel) if np.ndim(vel) == 0 else np.asarray(vel))
         if self.nh < 1:
             raise ValueError("nh must be >= 1")
@@ -148,6 +180,19 @@ class KirchhoffCIG:
         self._ang_s = None if ang_s is None else np.ascontiguousarray(ang_s, dtype=np.float32)
         self._ang_r = None if ang_r is None else np.ascontiguousarray(ang_r, dtype=np.float32)
 
+        # -- operator dip tables (anti-alias) -----------------------------------
+        dip_s = dip_r = None
+        if self.aa:
+            if _tables is not None and _tables.get("dip_s") is not None:
+                dip_s, dip_r = _tables["dip_s"], _tables["dip_r"]
+            else:
+                _check_ordered(self.srcs, "srcs")
+                _check_ordered(self.recs, "recs")
+                dip_s = trace_dips(self._trav_s, self.srcs)
+                dip_r = trace_dips(self._trav_r, self.recs)
+        self._dip_s = None if dip_s is None else np.ascontiguousarray(dip_s, dtype=np.float32)
+        self._dip_r = None if dip_r is None else np.ascontiguousarray(dip_r, dtype=np.float32)
+
         # -- gather binning -----------------------------------------------------
         if domain == "offset":
             hoff = 0.5 * np.abs(self.srcs[0][:, None] - self.recs[0][None, :])   # (ns, nr)
@@ -183,7 +228,19 @@ class KirchhoffCIG:
             tabr_a=None if self._ang_r is None else self._ang_r.reshape(self.nr, npts),
             ihd=self._ihd, hmax_rad=self._hmax_rad,
         )
+        if self.aa:                      # only the numpy engine accepts these so far
+            kw.update(
+                aa=True,
+                tabs_d=self._dip_s.reshape(self.ns, npts),
+                tabr_d=self._dip_r.reshape(self.nr, npts),
+                aaf=self._aa_scale(), aa_max=self.aa_max,
+            )
         if self.engine == "cuda":
+            if self.aa:
+                raise NotImplementedError(
+                    "anti-alias filtering is implemented in the numpy reference "
+                    "engine only so far; pass engine='numpy', or aa=False to "
+                    "migrate without it on the GPU")
             from ._engine_cuda import CudaEngine
             self._eng = CudaEngine(acc=acc, block=block, split=split, **kw)
         else:
@@ -219,6 +276,33 @@ class KirchhoffCIG:
         """Bin centres of the gather axis: metres (offset) or degrees (angle)."""
         dh = self.hmax / self.nh
         return (np.arange(self.nh) + 0.5) * dh
+
+    def _aa_scale(self):
+        """(ns, nr) float32 ``aa_factor * drho / dt``.
+
+        ``drho`` is the effective trace spacing of the source/receiver pair,
+        the root-mean-square of the two axis spacings (Lumley, Claerbout and
+        Bevc 1994, eq. 5). Equal source and receiver spacings give ``drho =
+        dx``; an axis with a single trace does not contribute and does not
+        count towards the mean."""
+        ds = trace_spacing(self.srcs)[:, None]
+        dr = trace_spacing(self.recs)[None, :]
+        k = (self.ns > 1) + (self.nr > 1)
+        if k == 0:
+            raise ValueError("anti-aliasing needs at least two sources or two receivers")
+        rho = np.sqrt((ds ** 2 + dr ** 2) / k) * (self.aa_factor / self.dt)
+        return np.ascontiguousarray(np.broadcast_to(rho, (self.ns, self.nr)),
+                                    dtype=np.float32)
+
+    def aa_widths(self):
+        """(ns, nr, nx, nz) int32 triangle half-widths in samples, or None when
+        anti-aliasing is off. Diagnostic only; the engines compute these on the
+        fly."""
+        if not self.aa:
+            return None
+        from ._engine_numpy import aa_width
+        return aa_width(self._dip_s[:, None], self._dip_r[None, :],
+                        self._aa_scale()[:, :, None, None], self.aa_max)
 
     @property
     def trav_srcs(self):
@@ -310,14 +394,16 @@ class KirchhoffCIG:
         """Small constant-velocity, single-point-scatterer operator.
 
         Keyword overrides accepted for any entry of the demo geometry
-        (``nh``, ``hmax``, ``domain``, ``nt``, ...)."""
+        (``nh``, ``hmax``, ``domain``, ``nt``, ...); anything else is passed
+        straight to the constructor (``aa``, ``acc``, ...)."""
         p = dict(_DEMO)
-        p.update(overrides)
+        p.update({k: v for k, v in overrides.items() if k in _DEMO})
+        extra = {k: v for k, v in overrides.items() if k not in _DEMO}
         srcs = np.stack([np.linspace(100.0, 900.0, p["ns"]), np.zeros(p["ns"])])
         recs = np.stack([np.linspace(0.0, 1000.0, p["nr"]), np.zeros(p["nr"])])
         op = cls(nx=p["nx"], nz=p["nz"], dx=p["dx"], dz=p["dz"], srcs=srcs, recs=recs,
                  nt=p["nt"], dt=p["dt"], vel=p["v"], nh=p["nh"], hmax=p["hmax"],
-                 domain=p["domain"], engine=engine)
+                 domain=p["domain"], engine=engine, **extra)
         op._demo = dict(v=p["v"], scatterer=tuple(p["scatterer"]), f0=p["f0"])
         return op
 
@@ -354,9 +440,11 @@ class KirchhoffCIG:
         kw = dict(nx=self.nx, nz=self.nz, dx=self.dx, dz=self.dz, srcs=self.srcs,
                   recs=self.recs, nt=self.nt, dt=self.dt, vel=self.vel, nh=self.nh,
                   hmax=self.hmax, domain=self.domain, ox=self.ox, oz=self.oz, acc=self.acc,
+                  aa=self.aa, aa_factor=self.aa_factor, aa_max=self.aa_max,
                   engine=self.engine if engine is None else engine,
                   _tables=dict(trav_s=self._trav_s, trav_r=self._trav_r,
-                               ang_s=self._ang_s, ang_r=self._ang_r))
+                               ang_s=self._ang_s, ang_r=self._ang_r,
+                               dip_s=self._dip_s, dip_r=self._dip_r))
         kw.update(overrides)
         op = KirchhoffCIG(**kw)
         if hasattr(self, "_demo"):
@@ -365,12 +453,13 @@ class KirchhoffCIG:
 
     def __repr__(self):
         return (f"KirchhoffCIG(shape_model={self.shape_model}, shape_data={self.shape_data}, "
-                f"domain={self.domain!r}, hmax={self.hmax:g}, engine={self.engine!r})")
+                f"domain={self.domain!r}, hmax={self.hmax:g}, aa={self.aa}, "
+                f"engine={self.engine!r})")
 
 
 # --------------------------------------------------------------------- migrate
 def migrate(data, vel, srcs, recs, dt, dx, dz, nh=1, hmax=None, domain="offset",
-            engine="auto", trav=None, ox=0.0, oz=0.0, **kwargs):
+            engine="auto", trav=None, ox=0.0, oz=0.0, aa=False, **kwargs):
     """One-shot Kirchhoff migration of prestack data to CIGs.
 
     Parameters
@@ -401,5 +490,5 @@ def migrate(data, vel, srcs, recs, dt, dx, dz, nh=1, hmax=None, domain="offset",
             raise ValueError("a scalar vel needs nx and nz keyword arguments") from exc
     op = KirchhoffCIG(nx=nx, nz=nz, dx=dx, dz=dz, srcs=srcs, recs=recs, nt=nt, dt=dt,
                       vel=vel, nh=nh, hmax=hmax, domain=domain, engine=engine, trav=trav,
-                      ox=ox, oz=oz, **kwargs)
+                      ox=ox, oz=oz, aa=aa, **kwargs)
     return op.adjoint(data)

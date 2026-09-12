@@ -247,3 +247,86 @@ def test_torch_double_backward():
     hv, = torch.autograd.grad((g * v).sum(), cig)       # Hessian-vector product A^T A v
     expected = op.adjoint(op.forward(v.numpy()))
     assert _rel(hv.numpy(), expected) < 1e-4
+
+
+# --------------------------------------------------------------- anti-alias
+def test_trace_dips_match_analytic_gradient():
+    """|dT/d(trace index)| from the tables vs the constant-velocity gradient."""
+    from kirchcig._traveltime import analytic_traveltime, trace_dips
+    v, nx, nz, dx, dz, spacing = 2000.0, 41, 21, 25.0, 25.0, 50.0
+    recs = np.stack([np.arange(21) * spacing, np.zeros(21)])
+    dip = trace_dips(analytic_traveltime(recs, v, nx, nz, dx, dz), recs) * spacing
+    x, z = np.arange(nx) * dx, np.arange(nz) * dz
+    r = 10
+    rad = np.hypot(x[:, None] - recs[0, r], z[None, :] - recs[1, r])
+    exact = np.abs((recs[0, r] - x[:, None]) / (v * np.maximum(rad, 1e-9))) * spacing
+    m = (rad > 100.0) & (exact > 1e-9)          # exact == 0 right below the receiver
+    assert np.median(np.abs(dip[r][m] - exact[m]) / exact[m]) < 0.01
+    assert dip.max() <= spacing / v * 1.001          # horizontal emergence is the bound
+
+
+def test_aa_width_one_is_the_unfiltered_operator():
+    """n == 1 is the identity triangle, so the filtered path must reproduce the
+    unfiltered one. Not bit for bit: the double integration recovers each
+    sample only to float64 cancellation, which is still far below float32."""
+    plain = KirchhoffCIG.demo(engine="numpy")
+    filt = KirchhoffCIG.demo(engine="numpy", aa=True, aa_factor=1e-9)
+    assert filt.aa and filt.aa_widths().max() == 1
+    d = plain.demo_data()
+    assert _rel(filt.adjoint(d), plain.adjoint(d)) < 1e-6
+    m = np.random.default_rng(0).standard_normal(plain.shape_model, dtype=np.float32)
+    assert _rel(filt.forward(m), plain.forward(m)) < 1e-6
+
+
+@pytest.mark.parametrize("kw", [{}, dict(nh=1), dict(domain="angle", nh=12, hmax=50.0)])
+def test_aa_dot_test(kw):
+    op = KirchhoffCIG.demo(engine="numpy", aa=True, aa_max=64, **kw)
+    assert op.aa_widths().max() > 1, "geometry must actually trigger filtering"
+    assert op.dot_test()
+
+
+def test_demo_forwards_unknown_keywords():
+    """demo() used to drop keywords it did not recognise, which silently
+    disabled aa= in tests."""
+    assert KirchhoffCIG.demo(engine="numpy", aa=True).aa
+    assert KirchhoffCIG.demo(engine="numpy", acc="float32").acc == "float32"
+
+
+def test_aa_sums_source_and_receiver_dips():
+    """Lumley, Claerbout and Bevc (1994) eq. 4 and sfmig2's tx expression add
+    the two sides; taking the larger of them would under-filter."""
+    from kirchcig._engine_numpy import aa_width
+    n_both = aa_width(np.float32(5e-4), np.float32(5e-4), np.float32(2e4), 999)
+    n_one = aa_width(np.float32(5e-4), np.float32(0.0), np.float32(2e4), 999)
+    assert int(n_both) - 1 == 2 * (int(n_one) - 1)
+
+
+def test_aa_suppresses_operator_aliasing():
+    """A band-limited spike in every trace of one shot maps to a migration
+    ellipse per trace. Coarse trace spacing leaves discrete arcs instead of a
+    smooth wavefront; the triangle filter has to bring the lateral roughness
+    back down to the densely sampled reference."""
+    from kirchcig._operator import ricker
+    v, nx, nz, dx, dz, dt, nt, f0 = 2000.0, 201, 61, 10.0, 10.0, 0.002, 500, 30.0
+    srcs = np.stack([[1000.0], [0.0]])
+
+    def image(nrec, **extra):
+        recs = np.stack([np.linspace(0.0, 2000.0, nrec), np.zeros(nrec)])
+        d = np.broadcast_to(ricker(np.arange(nt) * dt - 0.5, f0),
+                            (1, nrec, nt)).astype(np.float32)
+        op = KirchhoffCIG(nx=nx, nz=nz, dx=dx, dz=dz, srcs=srcs, recs=recs, nt=nt,
+                          dt=dt, vel=v, nh=1, engine="numpy", aa_max=64, **extra)
+        return np.asarray(op.adjoint(d)).sum(0) / nrec
+
+    def roughness(img):
+        m = np.abs(img) > 0.05 * np.abs(img).max()
+        d2 = np.zeros_like(img)
+        d2[1:-1] = img[2:] - 2 * img[1:-1] + img[:-2]
+        return np.sqrt((d2[m] ** 2).sum() / (img[m] ** 2).sum())
+
+    ref = roughness(image(201))                       # 10 m spacing, unaliased
+    aliased = roughness(image(21))                    # 100 m spacing
+    filtered = roughness(image(21, aa=True))
+    print(f"ref {ref:.3f}  aliased {aliased:.3f}  filtered {filtered:.3f}")
+    assert aliased > 2.0 * ref
+    assert filtered < 1.25 * ref

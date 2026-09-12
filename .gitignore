@@ -10,3 +10,7 @@ dist/
 # generated figures, except the curated ones used by the README
 *.png
 !docs/img/*.png
+
+# cuda emulation build artefacts (dev/)
+lib_fake_*.so
+kernel_body.inc

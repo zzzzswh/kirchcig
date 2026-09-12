@@ -79,6 +79,42 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
 - 可调项（`KirchhoffCIG` 构造参数或 `op._eng`）：`acc`（`float64`/`float32`）、`block`、`split`（`"auto"` 或整数）、`op._eng.set_time_chunk()`、`fblock`。
 - 反复调用（反演循环）时传入 cupy/CUDA tensor，避免每次主机-设备拷贝。
 
-## 8. 已知限制（与 README 一致）
+## 8. 反假频（v0.2，numpy 引擎已落地）
+
+算子假频的判据来自 Lumley, Claerbout & Bevc (1994)：沿算子轨迹求和的样点必须满足
+`f_max ≤ 1/(2ΔT)`，`ΔT = (dt_k/dρ)·Δρ` 是相邻道之间的算子时差。
+
+- **倾角 dt_k/dρ**：源侧与检波侧导数**之和**（LCB 式 4；Madagascar `sfmig2` 的
+  `tx = |x-h|/(v²(t1+dt)) + |x+h|/(v²(t2+dt))`），不是取大者。本实现按 LCB 建议的
+  「走时表差分」路线，对 `(n, nx, nz)` 表沿道轴做中心差分得到 `|dT/dx|` [s/m]，
+  比时间偏移的双曲近似准确，且自带走时表也能用。要求道轴按测线排序，否则告警。
+- **有效道距 Δρ**：两轴间距的均方根（LCB 式 5–7；2D 下 `dx_★` 退化为各自的道距）。
+  炮检间距相等时 `Δρ = dx`；只有一个炮点时该轴不参与均值。
+- **三角滤波**：`(1/n²)(D[i] − 2D[i−n] + D[i−2n])` 等于半宽 n 的归一化三角滤波，
+  `D` 为道的双重累加。3 次读取与 n 无关（LCB 的核心技巧）。半宽
+  `n = round((dip_s + dip_r)·aa_factor·Δρ/dt + 1)`，末尾 `+1` 对应 `trimo`/`sfmig2`
+  的 `+dt`，`n = 1` 即恒等。
+- **`aa_factor`**：等价于 Claerbout `trimo` 与 Madagascar `sfmig2` 的 `antialias`，
+  三者默认都是 1.0。2.0 把三角滤波的第一个零点放在假频上（LCB 式 12），是 Claerbout
+  偏移时用的值，代价是陡倾处分辨率。
+- **归一化**：本实现用精确的 `1/n²`（直流增益为 1），`sfmig2` 用
+  `(dt/(dt+tp−tm))²`，后者在 gap=1 时增益是 1/9 而非 1。选前者是为了保住
+  「n=1 逐位退化成不滤波」这个可测性质。
+- **共轭**：双重累加 `S` 的转置是反向双重累加，正演散射 6 个抽头后施加它，因此
+  算子对仍是精确转置，dot-test 在 offset/angle/nh=1 三种配置下均通过。
+  （`sfmig2` 用先因果后反因果的 `doubint`，那个算子自共轭，正反演可共用一个例程；
+  本实现尚未采用，是后续可以简化的地方。）
+- **精度**：float64 的 `D` 做二阶差分存在相消。实测 `n=1` 重建相对误差在白噪声下
+  约 4e-9、带限子波下 ~1e-20，且不随 `nt` 增长（测到 4001），远低于 float32 的 1.2e-7。
+- **验证**：单炮脉冲响应，31 道 @100 m 对 301 道 @10 m 参考。横向粗糙度
+  1.358（关闭）→ 0.563（antialias=1.0），参考值 0.554；峰值 0.0645 → 0.0528，参考 0.0568。
+
+**参考**：Lumley, Claerbout & Bevc, *Anti-aliased Kirchhoff 3-D migration*, SEG 1994 /
+SEP-80；Claerbout, *Antialiasing with triangles*, SEP-73 / BEI ch. `trimo`；
+Gray, *Frequency-selective design of the Kirchhoff migration operator*, Geophys. Prosp. 40, 1992；
+Abma, Sun & Bernitsas, *Antialiasing methods in Kirchhoff migration*, Geophysics 64, 1999；
+Madagascar `user/yliu/Mmig2.c` (`sfmig2`)。
+
+## 9. 已知限制（与 README 一致）
 
 无反假频滤波；仅 2D；offset 域按绝对半炮检距分箱不区分正负；变速度走时依赖 scikit-fmm 的一阶到达。

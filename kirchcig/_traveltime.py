@@ -138,6 +138,59 @@ def emergence_angles(trav, dx, dz):
     return out
 
 
+def trace_spacing(pos):
+    """Local trace spacing along the acquisition line [m], from a ``(2, n)``
+    array of positions. Central differences inside, one-sided at the ends;
+    zero for a single trace."""
+    p = np.asarray(pos, dtype=np.float64)
+    n = p.shape[1]
+    out = np.zeros(n, dtype=np.float64)
+    if n < 2:
+        return out
+    d = np.hypot(np.diff(p[0]), np.diff(p[1]))
+    out[1:-1] = 0.5 * (d[:-1] + d[1:])
+    out[0], out[-1] = d[0], d[-1]
+    return out
+
+
+def trace_dips(trav, pos):
+    """Operator dip ``|dT/dx|`` along the trace axis [s/m].
+
+    This is the derivative that enters the Kirchhoff operator anti-aliasing
+    criterion (Lumley, Claerbout and Bevc 1994, eq. 1 and 4): the summation
+    along the traveltime curve aliases once the moveout between neighbouring
+    traces approaches half a period of the highest frequency present. The paper
+    recommends exactly this table-differencing route for depth migration
+    driven by traveltime tables, in preference to the hyperbolic time-migration
+    approximation.
+
+    The trace axis is assumed to be ordered along the acquisition line;
+    :class:`~kirchcig.KirchhoffCIG` checks this and warns otherwise.
+
+    Parameters
+    ----------
+    trav : (n, nx, nz) traveltimes [s]
+    pos : (2, n) trace positions, rows (x, z) [m]
+
+    Returns
+    -------
+    (n, nx, nz) float32 array [s/m], zero for a single trace
+    """
+    trav = np.asarray(trav, dtype=np.float32)
+    if trav.ndim != 3:
+        raise ValueError("trav must be (n, nx, nz)")
+    out = np.zeros(trav.shape, dtype=np.float32)
+    if trav.shape[0] < 2:
+        return out
+    p = np.asarray(pos, dtype=np.float64)
+    d = np.hypot(np.diff(p[0]), np.diff(p[1]))
+    d = np.maximum(d, 1e-9).astype(np.float32)
+    out[1:-1] = np.abs(trav[2:] - trav[:-2]) / (d[:-1] + d[1:])[:, None, None]
+    out[0] = np.abs(trav[1] - trav[0]) / d[0]
+    out[-1] = np.abs(trav[-1] - trav[-2]) / d[-1]
+    return out
+
+
 def traveltime_tables(vel, srcs, recs, nx, nz, dx, dz, ox=0.0, oz=0.0, **eikonal_kwargs):
     """Build the source and receiver tables for a velocity model.
 
