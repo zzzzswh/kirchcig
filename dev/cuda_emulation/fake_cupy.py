@@ -44,7 +44,7 @@ class RawKernel:
             assert shared_mem == int(m["NH"]) * int(m["BLOCK"]) * acc_bytes, "adjoint smem"
         else:
             facc_bytes = 8 if int(m.get("AA", "0")) else acc_bytes
-            tchunk = int(args[12]); assert shared_mem == tchunk * facc_bytes, "forward smem"
+            tchunk = int(args[10]); assert shared_mem == tchunk * facc_bytes, "forward smem"
         # the data-side buffers must have the dtype the kernel was compiled for
         aa = int(m.get("AA", "0"))
         if self.name == "kirch_adjoint":
@@ -54,7 +54,7 @@ class RawKernel:
             in_dt = np.float32
             out_dt = np.float64 if aa else np.float32
         assert args[0].dtype == in_dt, ("input dtype", args[0].dtype, in_dt)
-        assert args[7].dtype == out_dt, ("output dtype", args[7].dtype, out_dt)
+        assert args[5].dtype == out_dt, ("output dtype", args[5].dtype, out_dt)
         cargs = []
         for a in args:
             if isinstance(a, np.ndarray):

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Adjoint memory traffic: the traveltime gradients of `aa_stretch` are packed
+  into the table element instead of a separate table (fields `t, a, d, w, gx,
+  gz`, padded to 1/2/4/8 floats), and the adjoint kernel processes sources in
+  register chunks of `schunk` (default 4), loading each receiver-table element
+  once per chunk instead of once per source. `schunk=` constructor knob,
+  `bench.py --schunk`.
+
 ## 0.2.0
 
 - Anti-alias filtering, `aa=True`, on both engines: a dip-adaptive triangle

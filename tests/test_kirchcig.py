@@ -542,6 +542,21 @@ def test_cuda_weights_match_numpy(kw):
 
 
 @needs_cuda
+@pytest.mark.parametrize("schunk", [1, 3, 8])
+def test_cuda_source_chunking_is_exact(schunk):
+    """The adjoint reuses each receiver-table element for SCH sources; chunks
+    that do not divide ns (SMALL has 5 sources) and source splits must give
+    the same sums."""
+    ref = KirchhoffCIG.demo(engine="cuda", **SMALL, nh=8, hmax=400.0, aa=True, weight="obliquity")
+    op = ref._clone(schunk=schunk)
+    d = ref.demo_data()
+    assert _rel(op.adjoint(d), ref.adjoint(d)) < 1e-6
+    op._eng.split = 2
+    assert _rel(op.adjoint(d), ref.adjoint(d)) < 1e-6
+    assert op.dot_test()
+
+
+@needs_cuda
 def test_cuda_aa_output_is_plain_float32_trace():
     op = KirchhoffCIG.demo(engine="cuda", aa=True, **SMALL)
     x = np.random.default_rng(0).standard_normal(op.shape_model, dtype=np.float32)

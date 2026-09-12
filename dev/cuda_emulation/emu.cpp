@@ -78,28 +78,26 @@ static void launch(unsigned gx, unsigned gy, unsigned block, F body) {
 
 // Launchers: the Python side supplies the grid exactly as it would to CuPy.
 extern "C" void launch_kirch_adjoint(unsigned gx, unsigned gy, unsigned block,
-        const void* data, const void* tab_s, const void* tab_r, const void* grd_s, const void* grd_r,
+        const void* data, const void* tab_s, const void* tab_r,
         const int* hbin, const float* aaf, void* out, int ns, int nr, int nt, int npts, int s_per_split,
         int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad,
         float aa_factor, float dxdt, float dzdt) {
     if (block != BLOCK) { fprintf(stderr, "block mismatch %u != %d\n", block, BLOCK); abort(); }
     launch(gx, gy, BLOCK, [&] {
-        kirch_adjoint((const din_t*)data, (const tab_t*)tab_s, (const tab_t*)tab_r,
-                      (const grad_t*)grd_s, (const grad_t*)grd_r, hbin, aaf,
+        kirch_adjoint((const din_t*)data, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
                       (OUT*)out, ns, nr, nt, npts, s_per_split, npad, pad, aa_max,
                       idt, ihd, hmax_rad, aa_factor, dxdt, dzdt);
     });
 }
 extern "C" void launch_kirch_forward(unsigned gx, unsigned gy, unsigned block,
-        const float* model, const void* tab_s, const void* tab_r, const void* grd_s, const void* grd_r,
+        const float* model, const void* tab_s, const void* tab_r,
         const int* hbin, const float* aaf, void* data, int ns, int nr, int nt, int npts, int tchunk,
         int npad, int pad, int aa_max, float idt, float ihd, float hmax_rad,
         float aa_factor, float dxdt, float dzdt) {
     if (block != FBLOCK) { fprintf(stderr, "fblock mismatch %u != %d\n", block, FBLOCK); abort(); }
     if (tchunk > TCHUNK_MAX) { fprintf(stderr, "tchunk too large\n"); abort(); }
     launch(gx, gy, FBLOCK, [&] {
-        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r,
-                      (const grad_t*)grd_s, (const grad_t*)grd_r, hbin, aaf,
+        kirch_forward(model, (const tab_t*)tab_s, (const tab_t*)tab_r, hbin, aaf,
                       (dout_t*)data, ns, nr, nt, npts, tchunk, npad, pad, aa_max,
                       idt, ihd, hmax_rad, aa_factor, dxdt, dzdt);
     });

@@ -76,7 +76,9 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
 | 累加 float64，表和数组 float32 | `-DACC=double`（可选 `float`），最终转 float32 输出 |
 | 模型布局 `(nh, nx, nz)`，道集轴最外 | adjoint 写回 `out[h*npts + ip]`、forward 读 `model[h*npts + ip]` 均 coalesced |
 | `nh`、block、累加类型编译期特化 | `-DNH -DBLOCK -DFBLOCK -DACC -DOUT -DANGLE -DAA`，`RawKernel` 进程内缓存 + CuPy 磁盘缓存 |
-| 反假频（第 8 节） | `-DAA=1`：表元素扩成 `{t,d}` / `{t,a,d,_}`，数据侧读 float64 双重累加 `D`，正演写 float64 部分和 |
+| 反假频（第 8 节） | `-DAA=1`：数据侧读 float64 双重累加 `D`，正演写 float64 部分和 |
+| 表元素打包 | 字段固定顺序 `t, a, d, w, gx, gz`，按在用字段数补到 1/2/4/8 个 float（`KC_WIDTH`），主机 `_upload` 同序；一项贡献每侧一到两次 16 B 对齐读取 |
+| 伴随炮点分组（`-DSCH`） | 检波点表 `nr·npts` 元素放不进 L2、每个炮点重读一遍，是伴随最主要的访存流；`SCH` 个炮点的表元素放寄存器，每个检波点元素一组只读一次，表流量 /SCH。尾部用 `kc_min(sc+k, s1-1)` 夹住做有效读取、`hbin` 置 −1 不参与 |
 
 在 README 之上增加的性能/健壮性措施：
 
@@ -166,8 +168,10 @@ forward:  d[s,r,it] += (1-w)·cig[h,ix,iz];  d[s,r,it+1] += w·cig[h,ix,iz]
   - **V100 实测**（README 规模，nh=32，float64）：全部 cuda 测试通过（NVRTC 接受 `alignas(16)`
     结构体和 `__fmul_rn`/`__fadd_rn`）；同一 session 内：`aa_stretch=False` adjoint 77.3 / forward 67.3 ms，
     `aa_stretch=True` 128.8 / 72.0 ms（另一天 `aa_stretch=False` 测得 98.5 ms——session 间差 25%，
-    比较只看同一次测的）。梯度表那 8 B/pair 让伴随慢 1.7 倍，说明伴随受表读取而非算术限制；下一步
-    优化是把 `gx, gz` 打包进 `tab_t`（offset 域 `{t,d,gx,gz}` 正好 16 B；angle 域会到 32 B）。正演的
+    比较只看同一次测的）。梯度表那 8 B/pair 让伴随慢 1.7 倍，说明伴随受表读取而非算术限制。据此做了
+    两件事（第 4 节表）：`gx, gz` 打包进 `tab_t`（offset+aa 正好 16 B，带角度或权重 32 B）；伴随按
+    `SCH=4` 个炮点分组复用检波点表元素。仿真下 SCH=1/3/4/8 与 numpy 逐位一致，含不整除 `ns` 的尾部和
+    source 分片。真机数字待测（`bench.py --aa`、`--aa --no_aa_stretch`、`--schunk 1/2/4/8`）。正演的
     2.6 倍比伴随的 1.9 倍重，来源是 6 次共享内存 double 原子加、`(ns,nr,npad)` float64 写出以及
     主机侧两次反向 `cumsum`；如果以后要压这部分，可以考虑在内核里用 block 内 scan 直接做反向双重
     积分，省掉 float64 中间缓冲。

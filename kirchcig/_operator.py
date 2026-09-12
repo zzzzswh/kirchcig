@@ -174,7 +174,7 @@ class KirchhoffCIG:
         and ``(nr, nx, nz)`` [s]
     ox, oz : origin of the image grid [m]
     acc : accumulator precision of the cuda engine, "float64" or "float32"
-    block, split : cuda engine tuning knobs (see ``_engine_cuda``)
+    block, split, schunk : cuda engine tuning knobs (see ``_engine_cuda``)
     eikonal : dict of keyword arguments for the eikonal solver
     aa : anti-alias filtering. Each contribution is read through a triangle
         filter whose half-width follows the local operator dip, which
@@ -239,7 +239,7 @@ class KirchhoffCIG:
 
     def __init__(self, nx, nz, dx, dz, srcs, recs, nt, dt, vel=None, nh=1, hmax=None,
                  domain="offset", engine="auto", trav=None, ox=0.0, oz=0.0,
-                 acc="float64", block=None, split="auto", eikonal=None,
+                 acc="float64", block=None, split="auto", schunk=4, eikonal=None,
                  aa=False, aa_factor=1.0, aa_max=32, aa_stretch=True, aperture=None, apt=None,
                  halfderiv=False, halfderiv_rho=None, weight=None, _tables=None):
         self.nx, self.nz = int(nx), int(nz)
@@ -252,6 +252,7 @@ class KirchhoffCIG:
         self.nh = int(nh)
         self.domain = domain
         self.acc = acc
+        self.schunk = int(schunk)
         self.aa = bool(aa)
         self.aa_factor = float(aa_factor)
         self.aa_max = int(aa_max)
@@ -416,7 +417,7 @@ class KirchhoffCIG:
                       tabr_w=self._w_r.reshape(self.nr, npts))
         if self.engine == "cuda":
             from ._engine_cuda import CudaEngine
-            self._eng = CudaEngine(acc=acc, block=block, split=split, **kw)
+            self._eng = CudaEngine(acc=acc, block=block, split=split, schunk=schunk, **kw)
         else:
             self._eng = NumpyEngine(**kw)
 
@@ -650,6 +651,7 @@ class KirchhoffCIG:
         kw = dict(nx=self.nx, nz=self.nz, dx=self.dx, dz=self.dz, srcs=self.srcs,
                   recs=self.recs, nt=self.nt, dt=self.dt, vel=self.vel, nh=self.nh,
                   hmax=self.hmax, domain=self.domain, ox=self.ox, oz=self.oz, acc=self.acc,
+                  schunk=self.schunk,
                   aa=self.aa, aa_factor=self.aa_factor, aa_max=self.aa_max,
                   aa_stretch=self.aa_stretch, aperture=self.aperture, apt=self.apt,
                   halfderiv=self.halfderiv, halfderiv_rho=self.halfderiv_rho,

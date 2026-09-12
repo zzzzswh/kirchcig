@@ -17,6 +17,8 @@ shared-memory allocation are injected as ``-D`` flags by ``_engine_cuda.py``:
             (anti-aliased stretch); needs the traveltime-gradient tables
     WEIGHT  1 = multiply every contribution by w_s(s, ip) * w_r(r, ip), the
             product of two per-side amplitude tables packed into the element
+    SCH     sources per chunk in the adjoint: each receiver-table element is
+            loaded once and reused for SCH sources (default 4)
 
 Both kernels compute the interpolation index and weights with the *same*
 float32 expression, so the pair is an exact transpose to accumulator precision.
@@ -62,6 +64,9 @@ CUDA_SOURCE = r"""
 #ifndef WEIGHT
 #define WEIGHT 0
 #endif
+#ifndef SCH
+#define SCH 4
+#endif
 
 // ---------------------------------------------------------------------------
 // double atomicAdd fallback for pre-Pascal devices (sm < 60). Only used in the
@@ -84,20 +89,28 @@ __device__ __forceinline__ double atomicAdd(double* address, double val)
 // ---------------------------------------------------------------------------
 // Traveltime table element. Whatever else a table row carries per image point
 // (emergence angle for the angle domain, operator dip for anti-aliasing, an
-// amplitude weight) is packed next to the traveltime, in the fixed order
-// t, a, d, w, padded to 1, 2 or 4 floats so it always comes from a single
-// aligned, coalesced load. The host packs the same order (_engine_cuda._upload).
+// amplitude weight, the traveltime gradient for the anti-aliased stretch) is
+// packed next to the traveltime, in the fixed order t, a, d, w, gx, gz, padded
+// to 1, 2, 4 or 8 floats so that it always comes from one or two aligned,
+// coalesced 16-byte loads. The host packs the same order (_engine_cuda._upload).
 // ---------------------------------------------------------------------------
-#define KC_NFIELDS (1 + ANGLE + AA + WEIGHT)
+#define KC_NFIELDS (1 + ANGLE + AA + WEIGHT + 2 * AAS)
 #if KC_NFIELDS == 1
+#define KC_WIDTH 1
+#elif KC_NFIELDS == 2
+#define KC_WIDTH 2
+#elif KC_NFIELDS <= 4
+#define KC_WIDTH 4
+#else
+#define KC_WIDTH 8
+#endif
+#define KC_PAD (KC_WIDTH - KC_NFIELDS)
+
+#if KC_WIDTH == 1
 typedef float tab_t;
 #define TAB_T(v) (v)
 #else
-#if KC_NFIELDS == 2
-struct alignas(8) tab_t {
-#else
-struct alignas(16) tab_t {
-#endif
+struct alignas(KC_WIDTH >= 4 ? 16 : 8) tab_t {
     float t;
 #if ANGLE
     float a;
@@ -108,17 +121,18 @@ struct alignas(16) tab_t {
 #if WEIGHT
     float w;
 #endif
-#if KC_NFIELDS == 3
-    float pad_;
+#if AAS
+    float gx;
+    float gz;
+#endif
+#if KC_PAD > 0
+    float pad_[KC_PAD];
 #endif
 };
 #define TAB_T(v) ((v).t)
 #define TAB_D(v) ((v).d)
 #define TAB_W(v) ((v).w)
 #endif
-
-// Traveltime gradient (d/dx, d/dz) [s/m] per image point, read only with AAS.
-struct alignas(8) grad_t { float gx; float gz; };
 
 // Data-side element types. With anti-aliasing the adjoint reads the float64
 // double integral and the forward writes float64 partial sums; otherwise both
@@ -181,10 +195,10 @@ __device__ __forceinline__ int kc_aa_width(float dip, float aaf, float cell, flo
 #if AAS
 // |gx_s + gx_r| dx/dt + |gz_s + gz_r| dz/dt: gradients summed before the
 // absolute value so the footprint vanishes at the specular point.
-__device__ __forceinline__ float kc_aa_cell(grad_t gs, grad_t gr, float dxdt, float dzdt)
+__device__ __forceinline__ float kc_aa_cell(const tab_t& vs, const tab_t& vr, float dxdt, float dzdt)
 {
-    const float bx = __fmul_rn(fabsf(__fadd_rn(gs.gx, gr.gx)), dxdt);
-    const float bz = __fmul_rn(fabsf(__fadd_rn(gs.gz, gr.gz)), dzdt);
+    const float bx = __fmul_rn(fabsf(__fadd_rn(vs.gx, vr.gx)), dxdt);
+    const float bz = __fmul_rn(fabsf(__fadd_rn(vs.gz, vr.gz)), dzdt);
     return __fadd_rn(bx, bz);
 }
 #endif
@@ -204,6 +218,12 @@ __device__ __forceinline__ float kc_aa_cell(grad_t gs, grad_t gr, float dxdt, fl
 // host reduces. The split exists purely to fill large GPUs when npts/BLOCK is
 // a small number of blocks.
 //
+// The source loop runs in chunks of SCH: the chunk's source-table elements sit
+// in registers and every receiver-table element is loaded once per chunk
+// instead of once per source. The receiver table (nr * npts elements) does not
+// fit in L2, so this divides the dominant table traffic by SCH; the data taps
+// are per pair and unaffected.
+//
 // npad is the row length of one trace in `data` and pad the index of time
 // sample 0 in that row (nt and 0 without anti-aliasing).
 // ---------------------------------------------------------------------------
@@ -211,8 +231,6 @@ extern "C" __global__ void __launch_bounds__(BLOCK)
 kirch_adjoint(const din_t*  __restrict__ data,
               const tab_t*  __restrict__ tab_s,
               const tab_t*  __restrict__ tab_r,
-              const grad_t* __restrict__ grd_s,
-              const grad_t* __restrict__ grd_r,
               const int*    __restrict__ hbin,
               const float*  __restrict__ aaf,
               OUT*          __restrict__ out,
@@ -232,57 +250,65 @@ kirch_adjoint(const din_t*  __restrict__ data,
     for (int h = 0; h < NH; ++h) acc[h * BLOCK + tid] = (ACC)0;
 
     if (ip < npts) {
-        for (int s = s0; s < s1; ++s) {
-            const tab_t vs = tab_s[(size_t)s * npts + ip];
-            const din_t* __restrict__ dsrc = data + (size_t)s * nr * npad;
-            const int*   __restrict__ hrow = hbin + (size_t)s * nr;
-#if AA
-            const float* __restrict__ arow = aaf + (size_t)s * nr;
-#endif
-#if AAS
-            const grad_t gs = grd_s[(size_t)s * npts + ip];
-#endif
+        for (int sc = s0; sc < s1; sc += SCH) {
+            tab_t vs[SCH];
+            #pragma unroll
+            for (int k = 0; k < SCH; ++k)              // clamp: a valid load, unused past s1
+                vs[k] = tab_s[(size_t)kc_min(sc + k, s1 - 1) * npts + ip];
 
             for (int r = 0; r < nr; ++r) {
-                const int hb = hrow[r];                // uniform across the block
-                if (hb < 0) continue;
+                int hbk[SCH];
+                bool any = false;
+                #pragma unroll
+                for (int k = 0; k < SCH; ++k) {        // uniform across the block
+                    hbk[k] = (sc + k < s1) ? hbin[(size_t)(sc + k) * nr + r] : -1;
+                    any = any || (hbk[k] >= 0);
+                }
+                if (!any) continue;
 
-                const tab_t vr = tab_r[(size_t)r * npts + ip];   // coalesced
-                const float t  = (TAB_T(vs) + TAB_T(vr)) * idt;
-                const int   it = (int)floorf(t);
-                if (it < 0 || it >= nt - 1) continue;
+                const tab_t vr = tab_r[(size_t)r * npts + ip];   // coalesced, once per chunk
+
+                #pragma unroll
+                for (int k = 0; k < SCH; ++k) {
+                    const int hb = hbk[k];
+                    if (hb < 0) continue;
+                    const int s = sc + k;
+                    const float t  = (TAB_T(vs[k]) + TAB_T(vr)) * idt;
+                    const int   it = (int)floorf(t);
+                    if (it < 0 || it >= nt - 1) continue;
 #if ANGLE
-                const int h = kc_angle_bin(vs.a, vr.a, ihd, hmax_rad);
-                if (h < 0) continue;
+                    const int h = kc_angle_bin(vs[k].a, vr.a, ihd, hmax_rad);
+                    if (h < 0) continue;
 #else
-                const int h = hb;
+                    const int h = hb;
 #endif
-                const float w = t - (float)it;
-                const din_t* __restrict__ tr = dsrc + (size_t)r * npad + (it + pad);
+                    const float w = t - (float)it;
+                    const din_t* __restrict__ tr = data + ((size_t)s * nr + r) * npad + (it + pad);
 #if WEIGHT
-                const ACC wt = (ACC)__fmul_rn(TAB_W(vs), TAB_W(vr));
+                    const ACC wt = (ACC)__fmul_rn(TAB_W(vs[k]), TAB_W(vr));
 #else
-                const ACC wt = (ACC)1;
+                    const ACC wt = (ACC)1;
 #endif
 #if AA
-                // tap(off) = D[it+off]*(1-w) + D[it+off+1]*w, all float64.
+                    // tap(off) = D[it+off]*(1-w) + D[it+off+1]*w, all float64.
 #if AAS
-                const float cell = kc_aa_cell(gs, grd_r[(size_t)r * npts + ip], dxdt, dzdt);
+                    const float cell = kc_aa_cell(vs[k], vr, dxdt, dzdt);
 #else
-                const float cell = 0.0f;
+                    const float cell = 0.0f;
 #endif
-                const int    n  = kc_aa_width(__fadd_rn(TAB_D(vs), TAB_D(vr)), arow[r], cell,
-                                              aa_factor, aa_max);
-                const double w1 = (double)(1.0f - w), w2 = (double)w;
-                const double tp  = tr[n - 1]  * w1 + tr[n]      * w2;
-                const double tm  = tr[-1]     * w1 + tr[0]      * w2;
-                const double tmm = tr[-n - 1] * w1 + tr[-n]     * w2;
-                const double nn  = (double)n * (double)n;
-                acc[h * BLOCK + tid] += wt * (ACC)((tp - 2.0 * tm + tmm) / nn);
+                    const int    n  = kc_aa_width(__fadd_rn(TAB_D(vs[k]), TAB_D(vr)),
+                                                  aaf[(size_t)s * nr + r], cell, aa_factor, aa_max);
+                    const double w1 = (double)(1.0f - w), w2 = (double)w;
+                    const double tp  = tr[n - 1]  * w1 + tr[n]      * w2;
+                    const double tm  = tr[-1]     * w1 + tr[0]      * w2;
+                    const double tmm = tr[-n - 1] * w1 + tr[-n]     * w2;
+                    const double nn  = (double)n * (double)n;
+                    acc[h * BLOCK + tid] += wt * (ACC)((tp - 2.0 * tm + tmm) / nn);
 #else
-                acc[h * BLOCK + tid] += wt * ((ACC)tr[0] * (ACC)(1.0f - w)
-                                            + (ACC)tr[1] * (ACC)w);
+                    acc[h * BLOCK + tid] += wt * ((ACC)tr[0] * (ACC)(1.0f - w)
+                                                + (ACC)tr[1] * (ACC)w);
 #endif
+                }
             }
         }
 
@@ -312,8 +338,6 @@ extern "C" __global__ void __launch_bounds__(FBLOCK)
 kirch_forward(const float*  __restrict__ model,
               const tab_t*  __restrict__ tab_s,
               const tab_t*  __restrict__ tab_r,
-              const grad_t* __restrict__ grd_s,
-              const grad_t* __restrict__ grd_r,
               const int*    __restrict__ hbin,
               const float*  __restrict__ aaf,
               dout_t*       __restrict__ data,
@@ -349,10 +373,6 @@ kirch_forward(const float*  __restrict__ model,
 #if AA
     const float aaf_pair = aaf[pair];
 #endif
-#if AAS
-    const grad_t* __restrict__ gs_row = grd_s + (size_t)s * npts;
-    const grad_t* __restrict__ gr_row = grd_r + (size_t)r * npts;
-#endif
 
     for (int ip = tid; ip < npts; ip += FBLOCK) {
         const tab_t vs = ts[ip];
@@ -363,7 +383,7 @@ kirch_forward(const float*  __restrict__ model,
         const int i0 = it + pad - t0;                  // window-relative index of sample it
 #if AA
 #if AAS
-        const float cell = kc_aa_cell(gs_row[ip], gr_row[ip], dxdt, dzdt);
+        const float cell = kc_aa_cell(vs, vr, dxdt, dzdt);
 #else
         const float cell = 0.0f;
 #endif
