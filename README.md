@@ -2,11 +2,11 @@
 
 **GPU Kirchhoff migration to common-image gathers (CIGs), with an exact adjoint.**
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](https://github.com/zzzzswh/kirchcig/blob/main/README.zh-CN.md)
 
 Hand-written CUDA kernels, compiled at runtime by NVRTC through CuPy. PyTorch is an optional zero-copy autograd adapter, not part of the compute path.
 
-![Stacked migrated image and the common-image gather at the scatterer](docs/img/cig.png)
+![Stacked migrated image and the common-image gather at the scatterer](https://raw.githubusercontent.com/zzzzswh/kirchcig/main/docs/img/cig.png)
 
 ## Install
 
@@ -105,7 +105,7 @@ op = KirchhoffCIG(..., aa=True)                 # default aa_factor=1.0, aa_max=
 
 Kirchhoff summation aliases wherever the operator's moveout between neighbouring traces exceeds half a period of the highest frequency present. It shows up as steeply dipping, criss-crossing arcs at large offsets and shallow depths; on coarsely sampled data they dominate the image. `aa=True` reads every contribution through a triangle filter whose half-width follows the local operator dip, the standard remedy of Lumley, Claerbout and Bevc (1994) as used by Claerbout's `trimo` and Madagascar's `sfmig2`.
 
-![Single-shot impulse response: aliased, anti-aliased, and a densely sampled reference](docs/img/antialias.png)
+![Single-shot impulse response: aliased, anti-aliased, and a densely sampled reference](https://raw.githubusercontent.com/zzzzswh/kirchcig/main/docs/img/antialias.png)
 
 <sub>One shot, a band-limited spike in every trace. Left: 31 receivers at 100 m, plain summation. Middle: the same data with `aa=True`. Right: 301 receivers at 10 m, no filter. `python examples/antialias.py`.</sub>
 
@@ -191,7 +191,7 @@ python examples/torch_deep_prior.py  # deep-prior LSM
 python benchmarks/bench.py           # timings
 ```
 
-![Gathers migrated with three velocities: too low, correct, too high](docs/img/vel_analysis.png)
+![Gathers migrated with three velocities: too low, correct, too high](https://raw.githubusercontent.com/zzzzswh/kirchcig/main/docs/img/vel_analysis.png)
 
 <sub>The same data migrated with three velocities. Flat gathers mean the velocity is right; curvature along the offset axis is what migration velocity analysis measures, and stacking destroys it.</sub>
 
